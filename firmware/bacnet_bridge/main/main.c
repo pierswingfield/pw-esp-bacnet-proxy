@@ -120,6 +120,79 @@ static bool MdnsEnabled = false;
 static bool MdnsRunning = false;
 static void mdns_apply_setting(void);
 
+/* ===================== Task registry & checked spawn =====================
+   Every xTaskCreate() in this file used to ignore its return value. That is
+   the single hardest class of bug this firmware has produced: a task stack
+   needs CONTIGUOUS internal DRAM, so under fragmentation the create fails
+   while total free heap still looks healthy, and the subsystem simply never
+   starts. It cost weeks - BACnet appearing broken after a flash was diagnosed
+   for a long time as a mysterious "flash quirk" when it was actually
+   bacnet_client_task failing to spawn against a heap MQTT had just claimed.
+
+   spawn_task() checks the result and logs the two numbers that explain it:
+   free heap AND largest free block. It also records the task so
+   /api/debug/stacks can report real headroom over HTTP - this board runs
+   headless in a wall enclosure, so serial-only instrumentation is no
+   instrumentation at all. */
+#define TASK_REGISTRY_MAX 10
+typedef struct {
+    const char  *name;
+    TaskHandle_t handle;
+    uint32_t     requested;
+} task_reg_entry_t;
+static task_reg_entry_t TaskRegistry[TASK_REGISTRY_MAX];
+static size_t TaskRegistryCount = 0;
+static portMUX_TYPE TaskRegistryMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void task_registry_add(const char *name, TaskHandle_t h, uint32_t requested)
+{
+    taskENTER_CRITICAL(&TaskRegistryMux);
+    if (TaskRegistryCount < TASK_REGISTRY_MAX) {
+        TaskRegistry[TaskRegistryCount].name = name;
+        TaskRegistry[TaskRegistryCount].handle = h;
+        TaskRegistry[TaskRegistryCount].requested = requested;
+        TaskRegistryCount++;
+    }
+    taskEXIT_CRITICAL(&TaskRegistryMux);
+}
+
+/* Any task that deletes itself MUST call this first. Querying a handle whose
+   TCB has been freed is undefined behaviour, so a self-deleting task has to
+   leave the registry before it goes. */
+static void task_registry_remove_self(void)
+{
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    taskENTER_CRITICAL(&TaskRegistryMux);
+    for (size_t i = 0; i < TaskRegistryCount; i++) {
+        if (TaskRegistry[i].handle == me) {
+            TaskRegistry[i] = TaskRegistry[TaskRegistryCount - 1];
+            TaskRegistryCount--;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&TaskRegistryMux);
+}
+
+static bool spawn_task(
+    TaskFunction_t fn, const char *name, uint32_t stack_bytes, void *arg,
+    UBaseType_t prio, TaskHandle_t *out_handle)
+{
+    TaskHandle_t h = NULL;
+    if (xTaskCreate(fn, name, stack_bytes, arg, prio, &h) == pdPASS) {
+        task_registry_add(name, h, stack_bytes);
+        if (out_handle) { *out_handle = h; }
+        return true;
+    }
+    ESP_LOGE("MAIN",
+             "xTaskCreate(\"%s\", %u bytes) FAILED - free heap %u B, largest block %u B",
+             name, (unsigned)stack_bytes,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+    diag_log("task create FAILED: %s (%u bytes)", name, (unsigned)stack_bytes);
+    if (out_handle) { *out_handle = NULL; }
+    return false;
+}
+
 /* ===================== In-Memory Web Log Buffer ===================== */
 /* Halved from 16384 on 2026-08-25. This is a plain static ring buffer for
    /api/logs; 8K still holds a useful scrollback and returns 8K of DRAM to a
@@ -1267,7 +1340,8 @@ static void bacnet_client_task(void *arg)
     bip_socket_esp_idf_set_netif(EthNetif);
     if (!bip_init(TargetPort)) {
         ESP_LOGE(TAG_BAC, "bip_init() failed");
-        vTaskDelete(NULL);
+        task_registry_remove_self();
+    vTaskDelete(NULL);
         return;
     }
 
@@ -1337,6 +1411,7 @@ static void bacnet_client_task(void *arg)
 
 done:
     ESP_LOGI(TAG_BAC, "BACnet client task done");
+    task_registry_remove_self();
     vTaskDelete(NULL);
 }
 
@@ -1427,7 +1502,8 @@ static void eth_bringup_task(void *arg)
                  "Ethernet/W5500 unavailable - continuing WiFi-only, no BACnet. "
                  "Check the W5500 wiring, then reboot.");
         diag_log("eth unavailable - running WiFi-only, no BACnet");
-        vTaskDelete(NULL);
+        task_registry_remove_self();
+    vTaskDelete(NULL);
         return;
     }
 
@@ -1485,7 +1561,12 @@ static void eth_bringup_task(void *arg)
     if (bacnet_handle == NULL) {
         ESP_LOGE(TAG_BAC, "bacnet_client task could not be created - no BACnet this boot");
         diag_log("bacnet task create failed - no BACnet this boot");
+    } else {
+        /* Statically created, so it never goes through spawn_task() - register
+           it by hand so /api/debug/stacks covers it like the rest. */
+        task_registry_add("bacnet_client", bacnet_handle, sizeof(BacnetStack));
     }
+    task_registry_remove_self();
     vTaskDelete(NULL);
 }
 
@@ -2969,6 +3050,61 @@ static esp_err_t api_device_mdns_post_handler(httpd_req_t *req)
 static const httpd_uri_t api_device_mdns_uri = {
     .uri = "/api/device/mdns", .method = HTTP_POST, .handler = api_device_mdns_post_handler};
 
+/* Stack headroom and heap, over HTTP.
+   headroom_bytes = requested_stack - worst-ever-used, from
+   uxTaskGetStackHighWaterMark(). A small number means that task came close to
+   overflowing; the httpd stack once ran with 1,772 bytes LESS than it needed
+   and crashed only under heavy requests, which is the failure this exists to
+   make visible before it happens.
+   Only currently-running tasks appear - self-deleting tasks (eth_bringup,
+   obj_scan) leave the registry before they exit, because querying a freed TCB
+   is undefined behaviour. "httpd" is measured directly: this handler runs on
+   that task, so NULL means "me".
+   largest_free_block is the number that predicts task-create failures, not
+   free_heap - stacks need contiguous memory. */
+static esp_err_t api_debug_stacks_get_handler(httpd_req_t *req)
+{
+    char buf[768];
+    int off = snprintf(
+        buf, sizeof(buf),
+        "{\"free_heap\":%u,\"min_free_heap\":%u,\"largest_free_block\":%u,\"tasks\":[",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+
+    /* Snapshot the registry so the critical section stays short. */
+    task_reg_entry_t snap[TASK_REGISTRY_MAX];
+    size_t count;
+    taskENTER_CRITICAL(&TaskRegistryMux);
+    count = TaskRegistryCount;
+    for (size_t i = 0; i < count; i++) {
+        snap[i] = TaskRegistry[i];
+    }
+    taskEXIT_CRITICAL(&TaskRegistryMux);
+
+    bool first = true;
+    for (size_t i = 0; i < count && off < (int)sizeof(buf) - 96; i++) {
+        unsigned head = (unsigned)uxTaskGetStackHighWaterMark(snap[i].handle);
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "%s{\"name\":\"%s\",\"requested\":%u,\"headroom_bytes\":%u}",
+                        first ? "" : ",", snap[i].name, (unsigned)snap[i].requested, head);
+        first = false;
+    }
+    if (off < (int)sizeof(buf) - 96) {
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "%s{\"name\":\"httpd\",\"requested\":%u,\"headroom_bytes\":%u}",
+                        first ? "" : ",", (unsigned)24576,
+                        (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, off);
+    return ESP_OK;
+}
+static const httpd_uri_t api_debug_stacks_uri = {
+    .uri = "/api/debug/stacks", .method = HTTP_GET, .handler = api_debug_stacks_get_handler};
+
 static esp_err_t api_wifi_reset_post_handler(httpd_req_t *req)
 {
     nvs_handle_t handle;
@@ -3415,7 +3551,8 @@ static void object_scan_task(void *arg)
         ScanState = SCAN_STATE_ERROR;
         snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "BACnet datalink not ready");
         ScanTaskHandle = NULL;
-        vTaskDelete(NULL);
+        task_registry_remove_self();
+    vTaskDelete(NULL);
         return;
     }
 
@@ -3490,6 +3627,7 @@ static void object_scan_task(void *arg)
 
     ScanState = SCAN_STATE_COMPLETE;
     ScanTaskHandle = NULL;
+    task_registry_remove_self();
     vTaskDelete(NULL);
 }
 
@@ -3524,7 +3662,7 @@ static esp_err_t api_objects_scan_start_handler(httpd_req_t *req)
        followed by an IntegerDivideByZero panic on the corrupted stack. The
        task is transient - created per scan, deleted at the end - so this is
        borrowed for the duration of a scan, not held. */
-    if (xTaskCreate(object_scan_task, "obj_scan", 24576, NULL, 5, &ScanTaskHandle) != pdPASS) {
+    if (!spawn_task(object_scan_task, "obj_scan", 24576, NULL, 5, &ScanTaskHandle)) {
         /* Unchecked before: a failed create left ScanState at RUNNING and the
            scan hung at state=scanning forever with no error surfaced. */
         ScanState = SCAN_STATE_ERROR;
@@ -5362,7 +5500,7 @@ static esp_err_t api_config_import_handler(httpd_req_t *req)
     /* If we were in SoftAP mode or WiFi credentials changed, a reboot joins the restored network */
     if (has_wifi_update || StaIp[0] == '\0') {
         reboot_required = true;
-        xTaskCreate(delayed_reboot_task, "delay_reboot", 2048, NULL, 5, NULL);
+        spawn_task(delayed_reboot_task, "delay_reboot", 2048, NULL, 5, NULL);
     }
 
     char resp[128];
@@ -5481,6 +5619,7 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &api_boost_uri);
         httpd_register_uri_handler(server, &api_boost_timeout_uri);
         httpd_register_uri_handler(server, &api_device_mdns_uri);
+        httpd_register_uri_handler(server, &api_debug_stacks_uri);
         httpd_register_uri_handler(server, &api_bacnet_read_uri);
         httpd_register_uri_handler(server, &api_bacnet_write_uri);
         httpd_register_uri_handler(server, &api_wifi_reset_uri);
@@ -6262,7 +6401,7 @@ static void mqtt_app_start(void)
 {
     if (!MqttCommandQueue) {
         MqttCommandQueue = xQueueCreate(8, sizeof(mqtt_command_t));
-        xTaskCreate(mqtt_command_task, "mqtt_command", 24576, NULL, 5, NULL);
+        spawn_task(mqtt_command_task, "mqtt_command", 24576, NULL, 5, NULL);
     }
     mqtt_app_restart();
 }
@@ -6638,7 +6777,7 @@ void app_main(void)
 
     BacnetMutex = xSemaphoreCreateMutex();
 
-    xTaskCreate(eth_bringup_task, "eth_bringup", 4096, NULL, 5, NULL);
+    spawn_task(eth_bringup_task, "eth_bringup", 4096, NULL, 5, NULL);
 
     char ssid[33] = {0};
     char pass[65] = {0};
@@ -6658,7 +6797,15 @@ void app_main(void)
                Toggleable from the setup wizard and the Update page. */
             mdns_apply_setting();
             mqtt_app_start();
-            xTaskCreate(mqtt_state_task, "mqtt_state", 24576, NULL, 5, NULL);
+            /* 16384, was 24576. Measured via /api/debug/stacks under real
+               workload: peak use 10,356 B, so this leaves ~6 KB of margin and
+               returns 8,192 B to the heap. Deliberately NOT applied to
+               mqtt_command - its measured peak of 752 B is unrepresentative
+               because that task only runs when Home Assistant sends an MQTT
+               command, and its real workload is the BACnet write path.
+               Trimming that one on an unexercised number is exactly how the
+               httpd stack ended up 1,772 B short and crashing. */
+            spawn_task(mqtt_state_task, "mqtt_state", 16384, NULL, 5, NULL);
             return;
         }
     } else {
