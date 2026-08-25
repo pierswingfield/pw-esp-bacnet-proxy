@@ -189,8 +189,17 @@
 /* devices that might respond to an I-Am on the network. */
 /* If your device is a simple server and does not need to bind, */
 /* then you don't need to use this. */
+/* 8, not the upstream default of 255. This is a Device-Instance -> IP binding
+   table, written from exactly two places in this firmware: bind_target_device(),
+   which seeds the one configured controller, and the I-Am handler during a
+   discovery sweep. After setup exactly one entry is ever used.
+   8 matches MAX_DISCOVERED_DEVICES in main.c, which already caps how many
+   devices the discovery UI will show - so anything above 8 is capacity the
+   firmware can never surface, and matching the two means the cache can never
+   silently drop a device the UI would have listed. At 36 B/entry this is
+   288 B instead of 9,180 B. */
 #if !defined(MAX_ADDRESS_CACHE)
-#define MAX_ADDRESS_CACHE 255
+#define MAX_ADDRESS_CACHE 8
 #endif
 
 /* some modules have debugging enabled using PRINT_ENABLED */

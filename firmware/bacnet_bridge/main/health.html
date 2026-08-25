@@ -148,22 +148,28 @@
         } else {
           intro.innerHTML = 'Controller reports <strong>' + s.fan_count + '</strong> fan' +
             (s.fan_count === 1 ? '' : 's') + ' configured of ' + s.fan_channels_total +
-            ' possible channels (<code>Number of FCU Fans</code>). Channels beyond that count are ' +
-            'shown for transparency — a reading there is not proof a fan exists.';
+            ' possible channels (<code>Number of FCU Fans</code>). Channels beyond that count aren\'t real fans on this unit and are hidden.';
         }
+        var rooms = s.rooms || [];
         (s.fan_supply_air || []).forEach(function(fan) {
+          /* Channels beyond fan_count aren't real fans on this installation - hide
+             them outright rather than showing an "implausible" reading. Added
+             2026-08-23 at Piers's request. */
+          if (!fan.configured) return;
           var d = document.createElement('div');
           d.className = 'row';
-          var tag = fan.configured
-            ? '<span class="tag">configured</span>'
-            : '<span class="tag warn">not in fan count</span>';
-          var cls = !fan.valid ? 'bad' : (fan.plausible ? (fan.configured ? 'ok' : 'neutral') : 'bad');
+          /* Fan N maps 1:1 to Rooms[N-1] by config order - same mapping the bridge
+             itself uses to publish per-room supply air. Falls back to "Fan N" if
+             there's no room at that index (fan count and room count can differ). */
+          var room = rooms[fan.fan - 1];
+          var label = room ? (room.name + ' Fan') : ('Fan ' + fan.fan);
+          var cls = !fan.valid ? 'bad' : (fan.plausible ? 'ok' : 'bad');
           var val = !fan.valid ? 'Unreadable'
             : fan.value.toFixed(1) + '°C' + (fan.plausible ? '' : ' (implausible)');
           if (fan.speed_valid) {
             val += ' <span style="font-weight:normal; color:#555; margin-left:0.3em;">· Speed: ' + fan.speed.toFixed(0) + '%</span>';
           }
-          d.innerHTML = '<span class="label">Fan ' + fan.fan + ' supply air' + tag + '</span>' +
+          d.innerHTML = '<span class="label">' + label + ' supply air</span>' +
                         '<span class="value ' + cls + '">' + val + '</span>';
           wrap.appendChild(d);
         });
@@ -229,8 +235,8 @@
         if (underDelivering && lowFlow && weakDelta && valveOpen) {
           h.push({ t:'Water side is not performing — supply temperature or system pressure (' + modeText + ')',
             d:'The valve is commanded open (' + valveSig.toFixed(0) + '%) yet flow is only ' +
-              flowPct.toFixed(0) + '% of design, and the air temperature is only changing ' +
-              s.delta_t.toFixed(1) + '°C across the coil. Water reaching the coil that is ' + tempProblem +
+              flowPct.toFixed(0) + '% of design, and the air is ' + (isHeating ? 'warming ' : 'cooling ') +
+              'only ' + Math.abs(s.delta_t).toFixed(1) + '°C across the coil. Water reaching the coil that is ' + tempProblem +
               ' — or not enough differential pressure to push it through — fits all three at once.',
             test:'Check whether the building’s ' + circuitText + ' plant is actually running, and what flow/return temperatures it is delivering.' });
           h.push({ t:'Restriction local to this dwelling',
@@ -239,7 +245,7 @@
         } else if (underDelivering && weakDelta && !lowFlow) {
           h.push({ t:'Flow is fine but water temperature is inadequate',
             d:'Flow is at ' + (flowValid ? flowPct.toFixed(0) + '%' : 'target') +
-              ' yet the air is only changing ' + s.delta_t.toFixed(1) + '°C.',
+              ' yet the air is only ' + (isHeating ? 'warming ' : 'cooling ') + Math.abs(s.delta_t).toFixed(1) + '°C.',
             test:'Compare the coil flow and return water temperatures — a small difference points upstream at the building plant.' });
         } else if (lowFlow && !valveOpen) {
           h.push({ t:'Low flow, but the valve is barely open',
@@ -292,9 +298,8 @@
           document.getElementById('lblDesign').textContent = isHeating ? 'Unit rated heating capacity' : 'Unit rated cooling capacity';
           document.getElementById('lblFlow').textContent = isHeating ? 'Heating valve flow' : 'Cooling valve flow';
           document.getElementById('lblValve').textContent = isHeating ? 'Heating valve signal' : 'Cooling valve signal';
-          document.getElementById('deltaNote').textContent = isHeating
-            ? 'Average of per-room Supply Air objects minus Return Air.'
-            : 'Return air minus the average of the per-room Supply Air objects.';
+          document.getElementById('deltaNote').textContent =
+            'Average of per-room Supply Air objects minus Return Air. Negative = cooling, positive = warming.';
 
           var curOut = isHeating ? s.heating_output : s.cooling_output;
           var curOutValid = isHeating ? s.heating_output_valid : s.cooling_output_valid;

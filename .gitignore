@@ -44,3 +44,6 @@ compile_commands.json
 # Test / debug logs
 *.log
 /tmp/
+
+# Session diagnosis write-ups (working notes, not part of the repo)
+docs/DIAGNOSIS_*.md
