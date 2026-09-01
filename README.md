@@ -74,6 +74,31 @@ This project was built from deep on-wire discovery and protocol analysis of the 
 - **Rollback-Protected LAN OTA Updates**: Password-protected web OTA update with dual 1900KB app partitions and automatic bootloader rollback safety.
 - **Configuration Backup & Restore**: Export and import complete device configuration as a single JSON file.
 
+## Stability build (25 August 2026)
+
+The current stability build is designed to keep the bridge useful through WiFi
+and Ethernet faults on the installed, headless hardware:
+
+- WiFi reconnects use bounded exponential backoff with jitter and a no-IP
+  reboot backstop. A W5500 initialisation failure now retries and degrades to
+  WiFi-only instead of aborting the whole bridge.
+- MQTT pauses during a WiFi outage, uses a bounded outbox, and recycles a
+  disconnected client so stalled TLS sockets cannot exhaust the heap.
+- BACnet reads use a 64-entry, 30-second cache and invalidate the relevant
+  entry after every write. This substantially reduces W5500 traffic while
+  browsing the dashboard; a displayed value can be up to 30 seconds old.
+- Core dumps persist in a dedicated 64 KB flash partition. The on-device
+  diagnostic log and `GET /api/debug/stacks` expose free heap, largest
+  contiguous block, and task-stack headroom for a headless device.
+
+The underlying RF issue remains a hardware/integration risk: an energised
+W5500 link can weaken the ESP32's WiFi uplink on the tested installation.
+The cache and fault handling mitigate its impact; they do not prove that an
+affected board, power supply, antenna placement, or cable is sound. See
+[`docs/DIAGNOSIS_2026-08-24.md`](docs/DIAGNOSIS_2026-08-24.md) and
+[`docs/LOGGING_TOOLS.md`](docs/LOGGING_TOOLS.md) before changing the hardware
+or diagnosing a new outage.
+
 ---
 
 ## Planned Future Roadmap
@@ -106,7 +131,9 @@ idf.py -p /dev/ttyUSB0 flash monitor
 3. Select your home 2.4GHz WiFi network, enter your password, and save.
 
 ### 4. Setup Wizard & Home Assistant Integration
-1. Open `http://esp-bacnet.local` (or the IP assigned by your router).
+1. Open the IP assigned by your router. The bridge's mDNS advertisement is
+   disabled by default to protect the RAM budget. If you explicitly enable it
+   in WiFi Setup or Update, `http://esp-bacnet-bridge.local` is also available.
 2. The **Setup Wizard** will launch automatically.
 3. Verify or discover your Delta controller's BACnet target IP (default `10.0.3.16`) and Device Instance ID (e.g. `753016`).
 4. Enter your MQTT broker details (`host`, `port`, `user`, `password`).

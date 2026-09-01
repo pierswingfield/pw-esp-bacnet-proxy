@@ -169,7 +169,14 @@ use an endpoint that reads live, or shorten the TTL for the duration of a test.
 ```bash
 curl -s http://<BRIDGE_IP>/api/network | python3 -m json.tool
 curl -s http://<BRIDGE_IP>/api/status  | python3 -m json.tool
+curl -s http://<BRIDGE_IP>/api/debug/stacks | python3 -m json.tool
 ```
+
+`/api/debug/stacks` is the first check after a suspected heap or task-start
+problem. Compare `largest_free_block` with the requested stack sizes, then
+look for unexpectedly small `headroom_bytes` on long-lived tasks. Only running
+tasks appear: short-lived Ethernet bring-up, object-scan, and BACnet-client
+tasks deregister before they delete themselves.
 
 If BACnet fields are invalid but the device responds, probe the raw layer for
 the actual error rather than a bare "invalid":
@@ -196,3 +203,13 @@ The listener script is kept at `tools/esp_bacnet_diag_listener.py.pi-copy-UNUSED
 To bring it back, re-add the `diag_udp_init()` / `diag_udp_send()` calls to
 `diag_log()`; git history has the removed implementation. **Do not re-enable
 it while investigating anything RF-related.**
+
+---
+
+## 8. Release-build checks
+
+For a build that will run unattended, capture all three views before calling
+it stable: `/api/network` for link and reset reason, `/api/status` for usable
+BACnet values, and `/api/debug/stacks` for heap fragmentation and stack
+headroom. Keep the matching ELF for any installed image so a later core dump
+can be decoded. A successful flash by itself is not a stability result.

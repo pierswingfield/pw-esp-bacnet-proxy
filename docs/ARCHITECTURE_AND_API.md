@@ -11,7 +11,7 @@ The primary goal of this project is to provide a robust, 100% local, zero-cloud 
 ### Key Architectural Constraints
 1. **Network Isolation**: The building's HVAC controller network (`10.0.3.x`) must remain physically and logically isolated from the resident's home WiFi network (`192.168.x.x`). The bridge achieves this by operating two completely independent `esp_netif` network interfaces.
 2. **Zero External Cloud**: No reliance on third-party cloud services, external accounts, or remote servers.
-3. **Resilience & Self-Healing**: Hardware brownout monitoring, automatic WiFi auto-reconnect with exponential backoff, watchdog timers, and bootloader app rollback for OTA updates.
+3. **Resilience & Self-Healing**: WiFi reconnect with exponential backoff and jitter, a no-IP reboot backstop, bounded MQTT recovery, Ethernet failure degradation to WiFi-only, crash capture, and bootloader app rollback for OTA updates.
 4. **App-Free Provisioning**: First-boot captive portal (`192.168.4.1`) and step-by-step Setup Wizard (`/wizard`).
 
 ---
@@ -80,19 +80,27 @@ State is saved across reboots using ESP-IDF NVS namespaces:
 - `nvs_mqtt`: `host`, `port`, `user`, `pass`, `prefix`.
 - `nvs_ota`: `password` (string).
 - `nvs_wifi`: `ssid`, `password`.
+- `app_cfg`: `mdns_en` (uint8). mDNS advertisement is opt-in and is enabled
+  only when this value is exactly `1`; MQTT broker discovery remains separate.
 
 ### Dual App Partitions & OTA Rollback
 The firmware uses custom partitions (`partitions.csv`):
 ```csv
 # Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x4000,
-otadata,  data, ota,     0xd000,  0x2000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x1D0000,
-ota_0,    app,  ota_0,   0x1E0000,0x1D0000,
-ota_1,    app,  ota_1,   0x3B0000,0x1D0000,
+nvs,      data, nvs,     0x9000,  0x6000,
+otadata,  data, ota,     0xf000,  0x2000,
+phy_init, data, phy,     0x11000, 0x1000,
+ota_0,    app,  ota_0,   0x20000, 1900K,
+ota_1,    app,  ota_1,   0x200000,1900K,
+coredump, data, coredump,0x3DB000,64K,
 ```
-With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, a newly flashed OTA image must successfully boot and call `esp_ota_mark_app_valid_cancel_rollback()`. If the new image crashes during boot, the bootloader automatically reverts to the previously working image.
+The actual offsets are assigned by the partition tool; the table above shows
+the resulting layout. With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, a newly
+flashed OTA image must successfully boot and call
+`esp_ota_mark_app_valid_cancel_rollback()`. If the new image crashes during
+boot, the bootloader automatically reverts to the previously working image.
+The coredump partition preserves panic data over reboot; decode it with the
+matching ELF as described in `LOGGING_TOOLS.md`.
 
 ---
 
@@ -110,6 +118,13 @@ With `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`, a newly flashed OTA image must s
 4. **Browser Memory & Object Cataloging**:
    - Fetching 430+ BACnet objects in a single JSON payload exceeded micro-controller RAM and caused web browser lockups.
    - Resolution: Implemented chunked paginated scanning (`/api/scan/objects?offset=...`) and on-device catalog pinning (`/api/catalog/pin`).
+5. **W5500 traffic and WiFi**:
+   - On the tested installation, live BACnet reads over an energised W5500
+     link can degrade the ESP32 WiFi uplink. The cause remains a physical
+     integration investigation, not a solved firmware defect.
+   - Resolution: A 64-entry, 30-second read-helper cache serves repeated
+     reads and precisely invalidates a point after each write. This bounds UI
+     staleness while avoiding unnecessary SPI traffic.
 
 ---
 
@@ -173,6 +188,12 @@ Returns WiFi, Ethernet link, BACnet target connection status, uptime, and reset 
 
 #### `GET /api/system/health`
 Returns micro-controller system telemetry (free heap, minimum free heap, free 8-bit heap, task list, project metadata).
+
+#### `GET /api/debug/stacks`
+Returns internal free heap, minimum-ever free heap, the largest contiguous
+free block, and requested-stack/headroom bytes for every registered running
+task plus the HTTP server task. Use `largest_free_block`, rather than total
+free heap, when investigating failed task creation or fragmentation.
 
 #### `GET /api/logs`
 Returns the recent in-memory circular log buffer.
@@ -240,6 +261,12 @@ Pins or unpins an object in the browser catalog.
 ---
 
 ### Configuration & OTA Endpoints
+
+#### `POST /api/device/mdns`
+Enables or disables the bridge's HTTP mDNS advertisement immediately and
+persists the choice. Send `value=on` or `value=off` as form data. It is off by
+default; enabling it advertises `esp-bacnet-bridge.local`. This does not
+disable the wizard's temporary MQTT-broker discovery query.
 
 #### `GET /api/config/export`
 Exports complete NVS configuration (WiFi, Target IP, Rooms, MQTT) as a downloadable JSON object.
