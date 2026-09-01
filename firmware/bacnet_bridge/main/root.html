@@ -51,6 +51,16 @@
       Leave the password blank only if your network is open (no password).
     </p>
 
+    <label style="display:flex; align-items:center; gap:0.6em; margin:1em 0 0.3em 0; cursor:pointer; font-size:0.92em;">
+      <input type="checkbox" id="mdnsToggle" style="width:auto; margin:0;">
+      <span>Advertise this bridge as <code>esp-bacnet-bridge.local</code></span>
+    </label>
+    <p class="note" id="mdnsNote" style="margin-top:0;">
+      Optional, and off by default. Lets you reach the bridge by name instead of
+      IP address, at the cost of a few KB of memory held permanently. You can
+      change this later on the Update page.
+    </p>
+
     <!-- Collapsed Configuration Restore Option -->
     <details style="margin-top:2em; border-top:1px solid #eee; padding-top:1em; font-size:0.9em; color:#475569;">
       <summary style="cursor:pointer; font-weight:bold; color:#06c;">Have a backup file? Restore complete configuration</summary>
@@ -67,6 +77,30 @@
 
     <script>
       var netListEl = document.getElementById('netList');
+      // mDNS preference is saved immediately, so it survives the connect below.
+      (function () {
+        var box = document.getElementById('mdnsToggle');
+        var note = document.getElementById('mdnsNote');
+        if (!box) { return; }
+        fetch('/api/network').then(function (r) { return r.json(); }).then(function (d) {
+          box.checked = !!d.mdns_enabled;
+        }).catch(function () { /* provisioning mode may not answer - leave unchecked */ });
+
+        box.addEventListener('change', function () {
+          var want = box.checked;
+          fetch('/api/device/mdns', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'value=' + (want ? 'on' : 'off')
+          }).then(function (r) { return r.json(); }).then(function (d) {
+            if (!d.ok) { box.checked = !want; note.textContent = 'Could not save that setting.'; }
+          }).catch(function () {
+            box.checked = !want;
+            note.textContent = 'Could not save that setting.';
+          });
+        });
+      })();
+
       var ssidHidden = document.getElementById('ssidHidden');
       var ssidManual = document.getElementById('ssid');
       var manualEntry = document.getElementById('manualEntry');

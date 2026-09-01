@@ -43,6 +43,7 @@
  * deliberately deferred since rooms/points are still fixed in firmware
  * (Rooms[] in this file), not user-editable from the UI.
  */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,7 @@
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "ethernet_init.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/inet.h"
@@ -97,8 +99,106 @@
 #include "bacnet/whois.h"
 #include "bacnet/basic/service/s_whois.h"
 
+/* Forward declared here (before every call site) so it's usable from
+   anywhere in the file regardless of definition order. Ships a line to the
+   serial console; see the "Diagnostics" block near app_main for the
+   definition and history. */
+static void diag_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/* Pause/resume the MQTT client across a WiFi outage. Forward declared here
+   because sta_event_handler() runs long before MqttClient is defined. See the
+   definitions next to mqtt_app_restart() for why this is disconnect()/
+   reconnect() rather than stop()/start(). */
+static void mqtt_pause_for_link_loss(void);
+static void mqtt_resume_after_link_up(void);
+
+/* mDNS .local advertisement. Declared here because /api/network reports the
+   state and /api/device/mdns sets it, both of which appear well before the
+   mDNS helpers themselves. Off by default - see NVS_KEY_MDNS_ENABLED. */
+#define MDNS_HOSTNAME "esp-bacnet-bridge"
+static bool MdnsEnabled = false;
+static bool MdnsRunning = false;
+static void mdns_apply_setting(void);
+
+/* ===================== Task registry & checked spawn =====================
+   Every xTaskCreate() in this file used to ignore its return value. That is
+   the single hardest class of bug this firmware has produced: a task stack
+   needs CONTIGUOUS internal DRAM, so under fragmentation the create fails
+   while total free heap still looks healthy, and the subsystem simply never
+   starts. It cost weeks - BACnet appearing broken after a flash was diagnosed
+   for a long time as a mysterious "flash quirk" when it was actually
+   bacnet_client_task failing to spawn against a heap MQTT had just claimed.
+
+   spawn_task() checks the result and logs the two numbers that explain it:
+   free heap AND largest free block. It also records the task so
+   /api/debug/stacks can report real headroom over HTTP - this board runs
+   headless in a wall enclosure, so serial-only instrumentation is no
+   instrumentation at all. */
+#define TASK_REGISTRY_MAX 10
+typedef struct {
+    const char  *name;
+    TaskHandle_t handle;
+    uint32_t     requested;
+} task_reg_entry_t;
+static task_reg_entry_t TaskRegistry[TASK_REGISTRY_MAX];
+static size_t TaskRegistryCount = 0;
+static portMUX_TYPE TaskRegistryMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void task_registry_add(const char *name, TaskHandle_t h, uint32_t requested)
+{
+    taskENTER_CRITICAL(&TaskRegistryMux);
+    if (TaskRegistryCount < TASK_REGISTRY_MAX) {
+        TaskRegistry[TaskRegistryCount].name = name;
+        TaskRegistry[TaskRegistryCount].handle = h;
+        TaskRegistry[TaskRegistryCount].requested = requested;
+        TaskRegistryCount++;
+    }
+    taskEXIT_CRITICAL(&TaskRegistryMux);
+}
+
+/* Any task that deletes itself MUST call this first. Querying a handle whose
+   TCB has been freed is undefined behaviour, so a self-deleting task has to
+   leave the registry before it goes. */
+static void task_registry_remove_self(void)
+{
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    taskENTER_CRITICAL(&TaskRegistryMux);
+    for (size_t i = 0; i < TaskRegistryCount; i++) {
+        if (TaskRegistry[i].handle == me) {
+            TaskRegistry[i] = TaskRegistry[TaskRegistryCount - 1];
+            TaskRegistryCount--;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&TaskRegistryMux);
+}
+
+static bool spawn_task(
+    TaskFunction_t fn, const char *name, uint32_t stack_bytes, void *arg,
+    UBaseType_t prio, TaskHandle_t *out_handle)
+{
+    TaskHandle_t h = NULL;
+    if (xTaskCreate(fn, name, stack_bytes, arg, prio, &h) == pdPASS) {
+        task_registry_add(name, h, stack_bytes);
+        if (out_handle) { *out_handle = h; }
+        return true;
+    }
+    ESP_LOGE("MAIN",
+             "xTaskCreate(\"%s\", %u bytes) FAILED - free heap %u B, largest block %u B",
+             name, (unsigned)stack_bytes,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+    diag_log("task create FAILED: %s (%u bytes)", name, (unsigned)stack_bytes);
+    if (out_handle) { *out_handle = NULL; }
+    return false;
+}
+
 /* ===================== In-Memory Web Log Buffer ===================== */
-#define LOG_BUFFER_SIZE 16384
+/* Halved from 16384 on 2026-08-25. This is a plain static ring buffer for
+   /api/logs; 8K still holds a useful scrollback and returns 8K of DRAM to a
+   device measured at 3-12K free heap once BACnet, WiFi, MQTT and the HTTP
+   server are all running. */
+#define LOG_BUFFER_SIZE 8192
 static char LogBuffer[LOG_BUFFER_SIZE];
 static size_t LogHead = 0;
 static size_t LogCount = 0;
@@ -736,10 +836,137 @@ static bool bacnet_write_locked(
    the httpd task). Returns false (without logging its own message - callers
    log with context) on mutex timeout, transaction failure, or a
    property/tag mismatch. */
+/* ===================== BACnet read cache =====================
+   Measured 2026-08-25: polling /api/status (which performs ~8 live BACnet
+   reads per refresh) took WiFi packet loss from 6.7% idle to 43.3%, while
+   hammering /api/network (HTTP with no BACnet reads) held 0.0% over 200
+   requests. HTTP serving is innocent; the W5500 traffic is what hurts the
+   radio. Every read avoided is SPI and Ethernet activity that does not
+   happen next to the antenna.
+
+   mqtt_state_task already polls the same points every 45s, so a dashboard
+   refresh can almost always be answered from what that poll already fetched.
+   Entries are invalidated precisely on write, so a setpoint or power change
+   made through the UI is reflected immediately rather than after the TTL. */
+#define BACNET_CACHE_ENTRIES 64
+#define BACNET_CACHE_TTL_MS  30000   /* < the 45s poll period, so staleness is bounded */
+
+typedef enum {
+    BC_KIND_NONE = 0,
+    BC_KIND_REAL,
+    BC_KIND_BOOL,
+    BC_KIND_MSV
+} bacnet_cache_kind_t;
+
+typedef struct {
+    uint16_t type;
+    uint32_t instance;
+    uint32_t property;
+    uint8_t  kind;
+    union { float f; bool b; unsigned u; } v;
+    int64_t  stamp_us;
+} bacnet_cache_entry_t;
+
+/* ~32B * 64 = ~2KB of .bss - affordable, and it buys a large cut in SPI traffic. */
+static bacnet_cache_entry_t BacnetCache[BACNET_CACHE_ENTRIES];
+static portMUX_TYPE BacnetCacheMux = portMUX_INITIALIZER_UNLOCKED;
+
+static bacnet_cache_entry_t *bacnet_cache_find(
+    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property)
+{
+    for (size_t i = 0; i < BACNET_CACHE_ENTRIES; i++) {
+        bacnet_cache_entry_t *e = &BacnetCache[i];
+        if (e->kind != BC_KIND_NONE && e->type == (uint16_t)type &&
+            e->instance == instance && e->property == (uint32_t)property) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/* Returns the entry to write into: an existing one for this key, a free slot,
+   or the oldest entry if the table is full. */
+static bacnet_cache_entry_t *bacnet_cache_slot(
+    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property)
+{
+    bacnet_cache_entry_t *e = bacnet_cache_find(type, instance, property);
+    if (e) {
+        return e;
+    }
+    bacnet_cache_entry_t *oldest = &BacnetCache[0];
+    for (size_t i = 0; i < BACNET_CACHE_ENTRIES; i++) {
+        if (BacnetCache[i].kind == BC_KIND_NONE) {
+            return &BacnetCache[i];
+        }
+        if (BacnetCache[i].stamp_us < oldest->stamp_us) {
+            oldest = &BacnetCache[i];
+        }
+    }
+    return oldest;
+}
+
+static bool bacnet_cache_get(
+    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property,
+    bacnet_cache_kind_t kind, void *out)
+{
+    bool hit = false;
+    taskENTER_CRITICAL(&BacnetCacheMux);
+    bacnet_cache_entry_t *e = bacnet_cache_find(type, instance, property);
+    if (e && e->kind == (uint8_t)kind &&
+        (esp_timer_get_time() - e->stamp_us) / 1000 < BACNET_CACHE_TTL_MS) {
+        switch (kind) {
+            case BC_KIND_REAL: *(float *)out = e->v.f; break;
+            case BC_KIND_BOOL: *(bool *)out = e->v.b; break;
+            case BC_KIND_MSV:  *(unsigned *)out = e->v.u; break;
+            default: break;
+        }
+        hit = true;
+    }
+    taskEXIT_CRITICAL(&BacnetCacheMux);
+    return hit;
+}
+
+static void bacnet_cache_put(
+    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property,
+    bacnet_cache_kind_t kind, const void *val)
+{
+    taskENTER_CRITICAL(&BacnetCacheMux);
+    bacnet_cache_entry_t *e = bacnet_cache_slot(type, instance, property);
+    e->type = (uint16_t)type;
+    e->instance = instance;
+    e->property = (uint32_t)property;
+    e->kind = (uint8_t)kind;
+    switch (kind) {
+        case BC_KIND_REAL: e->v.f = *(const float *)val; break;
+        case BC_KIND_BOOL: e->v.b = *(const bool *)val; break;
+        case BC_KIND_MSV:  e->v.u = *(const unsigned *)val; break;
+        default: break;
+    }
+    e->stamp_us = esp_timer_get_time();
+    taskEXIT_CRITICAL(&BacnetCacheMux);
+}
+
+/* Called after every successful write so the UI never shows a value it just
+   changed. Precise: only the written point is dropped. */
+static void bacnet_cache_invalidate(
+    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property)
+{
+    taskENTER_CRITICAL(&BacnetCacheMux);
+    bacnet_cache_entry_t *e = bacnet_cache_find(type, instance, property);
+    if (e) {
+        e->kind = BC_KIND_NONE;
+        e->stamp_us = 0;
+    }
+    taskEXIT_CRITICAL(&BacnetCacheMux);
+}
+
 static bool read_real_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, float *out_value)
 {
+    if (bacnet_cache_get(object_type, object_instance, property, BC_KIND_REAL, out_value)) {
+        return true;
+    }
     if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
         ESP_LOGW(TAG_BAC, "read_real_property: BACnet busy, timed out waiting for mutex");
         return false;
@@ -753,6 +980,7 @@ static bool read_real_property(
     }
     if (ok) {
         *out_value = v.type.Real;
+        bacnet_cache_put(object_type, object_instance, property, BC_KIND_REAL, out_value);
     }
     return ok;
 }
@@ -770,6 +998,11 @@ static bool write_real_property(
     v.type.Real = value;
     bool ok = bacnet_write_locked(object_type, object_instance, property, &v);
     xSemaphoreGive(BacnetMutex);
+    if (ok) {
+        /* Drop the cached copy so the very next read reflects what we wrote,
+           rather than serving the pre-write value for up to the TTL. */
+        bacnet_cache_invalidate(object_type, object_instance, property);
+    }
     return ok;
 }
 
@@ -778,6 +1011,9 @@ static bool read_bool_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, bool *out_value)
 {
+    if (bacnet_cache_get(object_type, object_instance, property, BC_KIND_BOOL, out_value)) {
+        return true;
+    }
     if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
         ESP_LOGW(TAG_BAC, "read_bool_property: BACnet busy, timed out waiting for mutex");
         return false;
@@ -791,6 +1027,7 @@ static bool read_bool_property(
     }
     if (ok) {
         *out_value = v.type.Enumerated != 0;
+        bacnet_cache_put(object_type, object_instance, property, BC_KIND_BOOL, out_value);
     }
     return ok;
 }
@@ -808,6 +1045,11 @@ static bool write_bool_property(
     v.type.Enumerated = value ? 1 : 0;
     bool ok = bacnet_write_locked(object_type, object_instance, property, &v);
     xSemaphoreGive(BacnetMutex);
+    if (ok) {
+        /* Drop the cached copy so the very next read reflects what we wrote,
+           rather than serving the pre-write value for up to the TTL. */
+        bacnet_cache_invalidate(object_type, object_instance, property);
+    }
     return ok;
 }
 
@@ -816,6 +1058,9 @@ static bool read_msv_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, unsigned *out_value)
 {
+    if (bacnet_cache_get(object_type, object_instance, property, BC_KIND_MSV, out_value)) {
+        return true;
+    }
     if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
         ESP_LOGW(TAG_BAC, "read_msv_property: BACnet busy, timed out waiting for mutex");
         return false;
@@ -829,6 +1074,7 @@ static bool read_msv_property(
     }
     if (ok) {
         *out_value = (unsigned)v.type.Unsigned_Int;
+        bacnet_cache_put(object_type, object_instance, property, BC_KIND_MSV, out_value);
     }
     return ok;
 }
@@ -846,6 +1092,11 @@ static bool write_msv_property(
     v.type.Unsigned_Int = value;
     bool ok = bacnet_write_locked(object_type, object_instance, property, &v);
     xSemaphoreGive(BacnetMutex);
+    if (ok) {
+        /* Drop the cached copy so the very next read reflects what we wrote,
+           rather than serving the pre-write value for up to the TTL. */
+        bacnet_cache_invalidate(object_type, object_instance, property);
+    }
     return ok;
 }
 
@@ -1089,18 +1340,34 @@ static void bacnet_client_task(void *arg)
     bip_socket_esp_idf_set_netif(EthNetif);
     if (!bip_init(TargetPort)) {
         ESP_LOGE(TAG_BAC, "bip_init() failed");
-        vTaskDelete(NULL);
+        task_registry_remove_self();
+    vTaskDelete(NULL);
         return;
     }
 
     address_init();
     init_bacnet_handlers();
-    bind_target_device();
 
-    if (!address_bind_request(TargetDeviceInstance, &max_apdu, &Target_Address)) {
-        ESP_LOGE(TAG_BAC, "address_bind_request failed even after pre-seeding - bug");
-        vTaskDelete(NULL);
-        return;
+    /* Retry the bind indefinitely with a 5s backoff instead of giving up after
+       one failure. Added 2026-08-23: this used to vTaskDelete on a single
+       failed address_bind_request, which left BacnetReady false forever - the
+       bridge would sit there with the controller fully reachable (verified
+       independently) but never bind, needing a manual power cycle to recover.
+       bind_target_device() just re-seeds the address cache from static config,
+       cheap to repeat. */
+    int bind_attempt = 0;
+    for (;;) {
+        bind_target_device();
+        if (address_bind_request(TargetDeviceInstance, &max_apdu, &Target_Address)) {
+            break;
+        }
+        bind_attempt++;
+        ESP_LOGE(TAG_BAC, "address_bind_request failed (attempt %d) - retrying in 5s", bind_attempt);
+        diag_log("bacnet bind failed (attempt %d) - retrying in 5s", bind_attempt);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    if (bind_attempt > 0) {
+        diag_log("bacnet bind succeeded after %d retries", bind_attempt);
     }
     /* Target is bound and the datalink/handlers are up - safe from here on
        for other tasks (e.g. the HTTP status handler) to also send requests,
@@ -1144,6 +1411,7 @@ static void bacnet_client_task(void *arg)
 
 done:
     ESP_LOGI(TAG_BAC, "BACnet client task done");
+    task_registry_remove_self();
     vTaskDelete(NULL);
 }
 
@@ -1207,7 +1475,37 @@ static void eth_bringup_task(void *arg)
 {
     uint8_t eth_port_cnt = 0;
     esp_eth_handle_t *eth_handles;
-    ESP_ERROR_CHECK(example_eth_init(&eth_handles, &eth_port_cnt));
+
+    /* Do NOT ESP_ERROR_CHECK this. A W5500 that fails its SPI chip-ID read used
+       to abort() here, which boot-looped the entire bridge - WiFi, dashboard,
+       MQTT and OTA all died because the Ethernet chip was unreachable. With the
+       board in a wall enclosure that is unrecoverable without pulling it out.
+       Hit for real on 2026-08-24 after the module was physically disturbed:
+       "emac_w5500_init(826): verify chip ID failed" -> ~65 panics in 40s.
+       Ethernet is not required for the device to be reachable or updatable, so
+       a missing W5500 now degrades to WiFi-only instead of bricking the unit.
+       BACnet simply never starts, BacnetReady stays false, and /api/status
+       reports its fields invalid - which is the correct visible symptom. */
+    esp_err_t eth_err = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        eth_err = example_eth_init(&eth_handles, &eth_port_cnt);
+        if (eth_err == ESP_OK && eth_port_cnt > 0) {
+            break;
+        }
+        ESP_LOGE(TAG_BAC, "Ethernet/W5500 init failed (attempt %d/3): %s",
+                 attempt, esp_err_to_name(eth_err));
+        diag_log("eth init failed attempt %d/3 - check W5500 wiring/SPI", attempt);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    if (eth_err != ESP_OK || eth_port_cnt == 0) {
+        ESP_LOGE(TAG_BAC,
+                 "Ethernet/W5500 unavailable - continuing WiFi-only, no BACnet. "
+                 "Check the W5500 wiring, then reboot.");
+        diag_log("eth unavailable - running WiFi-only, no BACnet");
+        task_registry_remove_self();
+    vTaskDelete(NULL);
+        return;
+    }
 
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
     EthNetif = esp_netif_new(&cfg);
@@ -1234,8 +1532,41 @@ static void eth_bringup_task(void *arg)
     ping_test();
     /* 24KB stack: nested MAX_APDU=1476-sized buffers across
        bip_receive/rp_ack_decode/bacapp_decode overflowed an 8KB stack
-       (see bacnet_client's README for the crash symptoms this fixed). */
-    xTaskCreate(bacnet_client_task, "bacnet_client", 24576, NULL, 5, NULL);
+       (see bacnet_client's README for the crash symptoms this fixed).
+
+       Retry the create, and check its return. 24576 bytes of stack comes out
+       of a heap the WiFi stack and MQTT client have usually already claimed:
+       free heap was 19K at this point on 2026-08-24 and the create failed
+       silently, leaving BACnet dead while the controller was fully reachable
+       (ping 4/4, 2ms). This is the real cause of the long-standing "first boot
+       after a flash shows broken BACnet reads for 60-200s, a second plain
+       reset clears it" quirk documented in docs/LOGGING_TOOLS.md - it is a
+       heap race against MQTT connecting, nothing to do with flashing, and the
+       second reset merely reshuffles the timing. */
+    /* Statically allocated stack. Retrying xTaskCreate() was not enough: with
+       33K of total free heap the create still failed, because a task stack
+       needs 24576 CONTIGUOUS bytes of internal DRAM and by the time WiFi, the
+       HTTP server and MQTT have all initialised, the heap is fragmented below
+       that even when the total looks ample. Reserving the stack in .bss makes
+       the allocation unconditional and immune to both fragmentation and
+       start-up ordering. It costs nothing extra at runtime - this task lives
+       for the life of the device, so the memory was never going to be
+       reclaimed anyway. Removes the last of the "BACnet silently never
+       started" failure mode for good. */
+    static StaticTask_t BacnetTcb;
+    static StackType_t BacnetStack[24576 / sizeof(StackType_t)];
+    TaskHandle_t bacnet_handle = xTaskCreateStatic(
+        bacnet_client_task, "bacnet_client",
+        sizeof(BacnetStack) / sizeof(StackType_t), NULL, 5, BacnetStack, &BacnetTcb);
+    if (bacnet_handle == NULL) {
+        ESP_LOGE(TAG_BAC, "bacnet_client task could not be created - no BACnet this boot");
+        diag_log("bacnet task create failed - no BACnet this boot");
+    } else {
+        /* Statically created, so it never goes through spawn_task() - register
+           it by hand so /api/debug/stacks covers it like the rest. */
+        task_registry_add("bacnet_client", bacnet_handle, sizeof(BacnetStack));
+    }
+    task_registry_remove_self();
     vTaskDelete(NULL);
 }
 
@@ -1275,6 +1606,91 @@ static EventGroupHandle_t WifiEventGroup;
 #define STA_CONNECTED_BIT BIT0
 #define STA_FAILED_BIT BIT1
 static int StaRetryCount = 0;
+static esp_netif_t *WifiNetif = NULL;
+static esp_timer_handle_t WifiReconnectTimer = NULL;
+
+/* Reconnect backoff step, separate from StaRetryCount (which pins at
+   STA_MAX_RETRIES after the first storm and stops being informative). Reset on
+   IP_EVENT_STA_GOT_IP. */
+static int StaBackoffStep = 0;
+
+/* Set on IP_EVENT_STA_GOT_IP, cleared on disconnect. StaEverHadIp gates the
+   reboot backstop so a device that has never been provisioned cannot reboot
+   itself out of the setup AP. */
+static volatile bool StaHasIp = false;
+static volatile bool StaEverHadIp = false;
+static volatile int64_t StaLostIpSinceUs = 0;
+
+/* Reboot if the station cannot regain an IP for this long. Last resort for a
+   wedged WiFi driver - see wifi_reconnect_timer_cb(). */
+#define STA_STALL_REBOOT_MS (10 * 60 * 1000)
+
+static uint32_t sta_backoff_ms(void);
+
+/* Exponential backoff with jitter: 1s, 2s, 4s, 8s, 15s, 15s...
+   The flat 1s/2s retry this replaces produced roughly 200 association attempts
+   during a single 6-minute outage (measured 2026-08-24). The AP answered that
+   with repeated `timeout (27)` and 4-way-handshake failures - auth would
+   succeed, association would not. Backing off gives each attempt room to
+   complete. The jitter avoids re-synchronising with any periodic AP-side
+   behaviour. 15s cap keeps recovery from a genuine one-second blip quick. */
+static uint32_t sta_backoff_ms(void)
+{
+    uint32_t base = 1000u << (StaBackoffStep > 4 ? 4 : StaBackoffStep);
+    if (base > 15000u) {
+        base = 15000u;
+    }
+    if (StaBackoffStep < 4) {
+        StaBackoffStep++;
+    }
+    return base + (esp_random() % 500u);
+}
+
+/* Self-sustaining reconnect. This MUST re-arm itself rather than relying on
+   the disconnect event handler to do it.
+   Failure this fixes (2026-08-25 00:42): esp_wifi_connect() was called once
+   from here, produced no disconnect event, and because the timer was only ever
+   armed from inside sta_event_handler() nothing ever rescheduled. The driver
+   then went completely silent for 9h43m while the device stayed up, healthy
+   and heap-clean, retrying MQTT into the void 3865 times. Before the
+   2026-08-24 change, esp_wifi_disconnect() in the disconnect handler generated
+   phantom events that happened to keep this loop alive - removing it took the
+   accidental safety net with it. Now the loop stands on its own. */
+static void wifi_reconnect_timer_cb(void *arg)
+{
+    (void)arg;
+    if (StaHasIp) {
+        return;
+    }
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+        diag_log("wifi connect call failed: %s", esp_err_to_name(err));
+    }
+
+    /* Last resort: if we have previously held an IP and have now been without
+       one for STA_STALL_REBOOT_MS, the driver is wedged beyond what
+       esp_wifi_connect() will fix. A reboot is recoverable; a silent 10-hour
+       stall on a board sealed in a wall enclosure is not. */
+    if (StaEverHadIp && StaLostIpSinceUs != 0) {
+        int64_t down_ms = (esp_timer_get_time() - StaLostIpSinceUs) / 1000;
+        if (down_ms > STA_STALL_REBOOT_MS) {
+            diag_log("wifi stalled %llds with no IP - rebooting", (long long)(down_ms / 1000));
+            esp_restart();
+        }
+    }
+
+    if (WifiReconnectTimer) {
+        esp_timer_start_once(WifiReconnectTimer, (uint64_t)sta_backoff_ms() * 1000);
+    }
+}
+
+/* Gateway IP (set on STA_GOT_IP) and last time it answered a ping - fed by
+   link_watchdog_task(), defined near app_main() once MqttBrokerHost exists.
+   diag_log() is forward-declared near the top of the file (before every call
+   site, including bacnet_client_task, which runs before this point). */
+static char GwIp[16] = {0};
+static volatile int64_t GwLastPingOkUs = 0;
+static volatile bool LinkWatchdogReconnectPending = false;
 
 /* Set once STA connects; read by the post-connect dashboard's /api/status. */
 static char StaSsid[33] = {0};
@@ -1355,28 +1771,65 @@ static void sta_event_handler(
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
-        ESP_LOGW(
-            TAG_WIFI, "STA disconnected: reason=%d (retry count %d)", event->reason,
-            StaRetryCount + 1);
+        /* One log line, not two. This runs on sys_evt; the previous ESP_LOGW +
+           diag_log() pair overflowed its stack on 2026-08-23 (the log line is
+           truncated mid-print at "DIA"). diag_log already carries the reason,
+           the retry count, uptime and free heap. */
+        diag_log("wifi disconnected reason=%d retry=%d", event->reason, StaRetryCount + 1);
+
+        /* Pause MQTT for the duration of the outage. Leaving the client
+           retrying through a storm pinned ~16K of heap in stuck esp-tls
+           sockets: free heap measured 3-4K during long storms, snapping back
+           to 19K the instant the netif tore down. */
+        if (StaHasIp) {
+            StaHasIp = false;
+            StaLostIpSinceUs = esp_timer_get_time();
+        }
+        mqtt_pause_for_link_loss();
+
+        /* esp_wifi_disconnect() used to be called here. It generated a second,
+           phantom disconnect event for every real one - 62x reason=205 against
+           4x reason=4 in one 32-minute window (2026-08-24) - doubling event
+           churn and making the retry counter meaningless. Removed. */
         if (StaRetryCount < STA_MAX_RETRIES) {
             StaRetryCount++;
-            vTaskDelay(pdMS_TO_TICKS(500));
-            esp_wifi_connect();
         } else if (WifiEventGroup) {
-            /* During initial boot provisioning check */
+            /* Initial boot provisioning check: give up and fall back to the AP */
             xEventGroupSetBits(WifiEventGroup, STA_FAILED_BIT);
+            return;
+        }
+        /* Normal operation: retry indefinitely, backing off. */
+        if (WifiReconnectTimer) {
+            esp_timer_stop(WifiReconnectTimer);
+            esp_timer_start_once(WifiReconnectTimer, (uint64_t)sta_backoff_ms() * 1000);
         } else {
-            /* Already in normal operation: keep retrying indefinitely */
-            vTaskDelay(pdMS_TO_TICKS(2000));
             esp_wifi_connect();
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG_WIFI, "STA got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         snprintf(StaIp, sizeof(StaIp), IPSTR, IP2STR(&event->ip_info.ip));
+        snprintf(GwIp, sizeof(GwIp), IPSTR, IP2STR(&event->ip_info.gw));
+        GwLastPingOkUs = esp_timer_get_time();
+        LinkWatchdogReconnectPending = false;
+        diag_log("wifi up ip=%s gw=%s", StaIp, GwIp);
         StaRetryCount = 0;
+        StaBackoffStep = 0;
+        StaHasIp = true;
+        StaEverHadIp = true;
+        StaLostIpSinceUs = 0;
+        mqtt_resume_after_link_up();
+        if (WifiNetif) {
+            esp_netif_set_default_netif(WifiNetif);
+        }
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        if (WifiReconnectTimer) {
+            esp_timer_stop(WifiReconnectTimer);
+        }
         if (WifiEventGroup) {
             xEventGroupSetBits(WifiEventGroup, STA_CONNECTED_BIT);
         }
@@ -1388,7 +1841,9 @@ static bool try_connect_sta(const char *ssid, const char *pass)
     StaRetryCount = 0;
     strlcpy(StaSsid, ssid, sizeof(StaSsid));
     WifiEventGroup = xEventGroupCreate();
-    esp_netif_create_default_wifi_sta();
+    if (!WifiNetif) {
+        WifiNetif = esp_netif_create_default_wifi_sta();
+    }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -1399,10 +1854,36 @@ static bool try_connect_sta(const char *ssid, const char *pass)
     wifi_config_t wifi_config = {0};
     strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
     strlcpy((char *)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
+    if (strlen(pass) == 0) {
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    } else {
+        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    }
+    wifi_config.sta.pmf_cfg.capable = true;
+    wifi_config.sta.pmf_cfg.required = false;
+
+    if (!WifiReconnectTimer) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = &wifi_reconnect_timer_cb,
+            .name = "wifi_reconnect"
+        };
+        esp_timer_create(&timer_args, &WifiReconnectTimer);
+    }
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* Disable modem-sleep power save: the default (WIFI_PS_MIN_MODEM) drops unicast
+       packets (pings, TCP SYN for web UI, ARP) on 802.11ax/DTIM APs. Device is mains powered. */
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    /* Reverted 2026-08-23: an 18dBm cap here (from an archived, untested comment about
+       power-rail dips during handshake) correlated with the router's own log showing
+       this client's RSSI decaying session over session (-62 -> -71 -> -93dBm) into
+       "disassociated due to inactivity" - i.e. a link that's too weak to sustain, the
+       opposite problem from what the cap was meant to fix. Left at the chip default
+       (no explicit cap) until there's real evidence the default causes brownouts on
+       this specific board. */
 
     ESP_LOGI(TAG_WIFI, "Connecting to saved SSID '%s'...", ssid);
     EventBits_t bits = xEventGroupWaitBits(
@@ -1772,10 +2253,11 @@ static esp_err_t api_network_get_handler(httpd_req_t *req)
         "{\"wifi_ssid\":\"%s\",\"wifi_ip\":\"%s\",\"wifi_rssi\":%s,\"eth_connected\":%s,"
         "\"bacnet_target_name\":%s,\"bacnet_target_ip\":\"%s\","
         "\"uptime_seconds\":%lld,\"last_reset_reason\":\"%s\",\"last_reset_is_power_issue\":%s,"
-        "\"ota_password_set\":%s}",
+        "\"ota_password_set\":%s,\"mdns_enabled\":%s,\"mdns_hostname\":\"%s.local\"}",
         StaSsid, StaIp, rssi_json, EthConnected ? "true" : "false", name_json, TargetIp,
         (long long)uptime_s, reset_reason, reset_is_power_issue ? "true" : "false",
-        ota_password_is_set() ? "true" : "false");
+        ota_password_is_set() ? "true" : "false",
+        MdnsEnabled ? "true" : "false", MDNS_HOSTNAME);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, off);
@@ -1787,6 +2269,8 @@ static const httpd_uri_t api_network_uri = {
 
 static esp_err_t api_status_get_handler(httpd_req_t *req)
 {
+    int64_t __req_start_us = esp_timer_get_time();
+    diag_log("http GET /api/status start");
     bool sys_power = false;
     bool sys_power_valid = BacnetReady && read_bool_property(
         OBJECT_BINARY_VALUE, SYS_POWER_READBACK_INSTANCE, PROP_PRESENT_VALUE, &sys_power);
@@ -1838,6 +2322,9 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, off);
+    diag_log("http GET /api/status done %lldms stack_free=%uB",
+        (long long)((esp_timer_get_time() - __req_start_us) / 1000),
+        (unsigned)uxTaskGetStackHighWaterMark(NULL));
     return ESP_OK;
 }
 
@@ -1846,6 +2333,8 @@ static const httpd_uri_t api_status_uri = {
 
 static esp_err_t api_health_get_handler(httpd_req_t *req)
 {
+    int64_t __req_start_us = esp_timer_get_time();
+    diag_log("http GET /api/health start");
     /* Cooling metrics */
     float cooling_output = 0.0f, required_cooling_output = 0.0f;
     bool cooling_output_valid = BacnetReady && read_real_property(
@@ -1957,12 +2446,13 @@ static esp_err_t api_health_get_handler(httpd_req_t *req)
         return_air_valid && temp_is_plausible(return_air) && supply_air_count > 0;
     float delta_t = 0.0f;
     if (delta_t_valid) {
+        /* Signed convention (2026-08-23): negative = cooling, positive = warming,
+           regardless of active_mode. Previously magnitude-only (always positive in
+           whichever mode was active), which required knowing the mode to interpret
+           the sign - see docs/SCOPE_2026-08-16_baseline-revert.md "Delta sign
+           convention". HA's temperature_delta device class handles negative values. */
         float avg_sa = supply_air_sum / supply_air_count;
-        if (strcmp(active_mode, "heating") == 0) {
-            delta_t = avg_sa - return_air;
-        } else {
-            delta_t = return_air - avg_sa;
-        }
+        delta_t = avg_sa - return_air;
     }
 
     unsigned cooling_valve_status = 0, heating_valve_status = 0;
@@ -2073,6 +2563,9 @@ static esp_err_t api_health_get_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, off);
+    diag_log("http GET /api/health done %lldms stack_free=%uB",
+        (long long)((esp_timer_get_time() - __req_start_us) / 1000),
+        (unsigned)uxTaskGetStackHighWaterMark(NULL));
     return ESP_OK;
 }
 
@@ -2424,6 +2917,7 @@ static esp_err_t api_room_power_post_handler(httpd_req_t *req)
     bool on = strcmp(value_str, "on") == 0;
     bool ok = BacnetReady && write_bool_property(
         OBJECT_BINARY_VALUE, Rooms[room_idx].power_instance, PROP_PRESENT_VALUE, on);
+    diag_log("room-power room=%d value=%s ok=%d", room_idx, value_str, ok);
     send_write_result(req, ok, NULL);
     return ESP_OK;
 }
@@ -2448,6 +2942,7 @@ static esp_err_t api_system_power_post_handler(httpd_req_t *req)
     bool on = strcmp(value_str, "on") == 0;
     bool ok = BacnetReady && write_bool_property(
         OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, on);
+    diag_log("system-power value=%s ok=%d", value_str, ok);
     send_write_result(req, ok, NULL);
     return ESP_OK;
 }
@@ -2515,6 +3010,100 @@ static esp_err_t api_boost_timeout_post_handler(httpd_req_t *req)
 
 static const httpd_uri_t api_boost_timeout_uri = {
     .uri = "/api/boost-timeout", .method = HTTP_POST, .handler = api_boost_timeout_post_handler};
+
+/* Toggle the mDNS .local advertisement. Off by default; exposed in the setup
+   wizard and on the Update page. Applied immediately - no reboot needed. */
+static esp_err_t api_device_mdns_post_handler(httpd_req_t *req)
+{
+    char body[48] = {0};
+    if (!recv_body(req, body, sizeof(body))) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    char value_str[12] = {0};
+    form_extract(body, "value", value_str, sizeof(value_str));
+
+    bool enable;
+    if (strcasecmp(value_str, "on") == 0 || strcasecmp(value_str, "true") == 0 ||
+        strcmp(value_str, "1") == 0) {
+        enable = true;
+    } else if (strcasecmp(value_str, "off") == 0 || strcasecmp(value_str, "false") == 0 ||
+               strcmp(value_str, "0") == 0) {
+        enable = false;
+    } else {
+        send_bad_request(req, "{\"ok\":false,\"error\":\"value must be on or off\"}");
+        return ESP_OK;
+    }
+
+    MdnsEnabled = enable;
+    app_config_save();
+    mdns_apply_setting();
+
+    char resp[96];
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"mdns_enabled\":%s,\"hostname\":\"%s.local\"}",
+             MdnsEnabled ? "true" : "false", MDNS_HOSTNAME);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+static const httpd_uri_t api_device_mdns_uri = {
+    .uri = "/api/device/mdns", .method = HTTP_POST, .handler = api_device_mdns_post_handler};
+
+/* Stack headroom and heap, over HTTP.
+   headroom_bytes = requested_stack - worst-ever-used, from
+   uxTaskGetStackHighWaterMark(). A small number means that task came close to
+   overflowing; the httpd stack once ran with 1,772 bytes LESS than it needed
+   and crashed only under heavy requests, which is the failure this exists to
+   make visible before it happens.
+   Only currently-running tasks appear - self-deleting tasks (eth_bringup,
+   obj_scan) leave the registry before they exit, because querying a freed TCB
+   is undefined behaviour. "httpd" is measured directly: this handler runs on
+   that task, so NULL means "me".
+   largest_free_block is the number that predicts task-create failures, not
+   free_heap - stacks need contiguous memory. */
+static esp_err_t api_debug_stacks_get_handler(httpd_req_t *req)
+{
+    char buf[768];
+    int off = snprintf(
+        buf, sizeof(buf),
+        "{\"free_heap\":%u,\"min_free_heap\":%u,\"largest_free_block\":%u,\"tasks\":[",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+
+    /* Snapshot the registry so the critical section stays short. */
+    task_reg_entry_t snap[TASK_REGISTRY_MAX];
+    size_t count;
+    taskENTER_CRITICAL(&TaskRegistryMux);
+    count = TaskRegistryCount;
+    for (size_t i = 0; i < count; i++) {
+        snap[i] = TaskRegistry[i];
+    }
+    taskEXIT_CRITICAL(&TaskRegistryMux);
+
+    bool first = true;
+    for (size_t i = 0; i < count && off < (int)sizeof(buf) - 96; i++) {
+        unsigned head = (unsigned)uxTaskGetStackHighWaterMark(snap[i].handle);
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "%s{\"name\":\"%s\",\"requested\":%u,\"headroom_bytes\":%u}",
+                        first ? "" : ",", snap[i].name, (unsigned)snap[i].requested, head);
+        first = false;
+    }
+    if (off < (int)sizeof(buf) - 96) {
+        off += snprintf(buf + off, sizeof(buf) - off,
+                        "%s{\"name\":\"httpd\",\"requested\":%u,\"headroom_bytes\":%u}",
+                        first ? "" : ",", (unsigned)24576,
+                        (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
+    off += snprintf(buf + off, sizeof(buf) - off, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, off);
+    return ESP_OK;
+}
+static const httpd_uri_t api_debug_stacks_uri = {
+    .uri = "/api/debug/stacks", .method = HTTP_GET, .handler = api_debug_stacks_get_handler};
 
 static esp_err_t api_wifi_reset_post_handler(httpd_req_t *req)
 {
@@ -2860,8 +3449,40 @@ typedef struct {
 } scanned_object_t;
 
 #define MAX_SCANNED_OBJECTS 480
-static scanned_object_t ScannedObjects[MAX_SCANNED_OBJECTS];
+
+/* Allocated on demand, not reserved. As a static array this was 480 * 72 =
+   34,560 bytes - the single largest allocation on the device, larger than any
+   task stack - held permanently for a commissioning tool. It is never
+   persisted to NVS, so it is already empty after every reboot; it exists only
+   to back the /objects browser between a scan and your selections. The durable
+   output of a scan is CustomMqttPoints (2,688 B, in NVS).
+   Allocated by /api/objects/scan-start, released after
+   SCAN_CATALOG_IDLE_MS with no reads. See scan_catalog_release_if_idle(). */
+#define SCAN_PAGE_OBJECTS 60
+#define SCAN_PAGE_COUNT (MAX_SCANNED_OBJECTS / SCAN_PAGE_OBJECTS)   /* 8 pages */
+static scanned_object_t *ScanPages[SCAN_PAGE_COUNT] = {0};
+
+/* Indexed accessor. The catalog is paged rather than one 34,560-byte block
+   because that single allocation had to compete with obj_scan's 24,576-byte
+   task stack for the same largest-free-block: taking 34.5K out of a 38K block
+   left 14K, and xTaskCreate() then failed silently, hanging the scan at
+   state=scanning forever (2026-08-25). Eight 4,320-byte pages fit a fragmented
+   heap comfortably and never contend with a task stack. */
+static inline scanned_object_t *scan_obj(size_t i)
+{
+    if (i >= MAX_SCANNED_OBJECTS) return NULL;
+    scanned_object_t *page = ScanPages[i / SCAN_PAGE_OBJECTS];
+    return page ? &page[i % SCAN_PAGE_OBJECTS] : NULL;
+}
+static inline bool scan_catalog_present(void) { return ScanPages[0] != NULL; }
 static size_t ScannedObjectCount = 0;
+static volatile int64_t ScanCatalogLastUseUs = 0;
+
+/* Free the catalog this long after the last read. Long enough to browse and
+   make selections without it vanishing mid-session; short enough that the RAM
+   is back well before it is needed elsewhere. */
+#define SCAN_CATALOG_IDLE_MS (10 * 60 * 1000)
+
 
 typedef enum {
     SCAN_STATE_IDLE = 0,
@@ -2877,6 +3498,46 @@ static uint8_t ScanPercent = 0;
 static char ScanErrorMsg[64] = {0};
 static TaskHandle_t ScanTaskHandle = NULL;
 
+static bool scan_catalog_acquire(void)
+{
+    ScanCatalogLastUseUs = esp_timer_get_time();
+    if (scan_catalog_present()) {
+        return true;
+    }
+    for (size_t p = 0; p < SCAN_PAGE_COUNT; p++) {
+        ScanPages[p] = calloc(SCAN_PAGE_OBJECTS, sizeof(scanned_object_t));
+        if (!ScanPages[p]) {
+            for (size_t q = 0; q < p; q++) { free(ScanPages[q]); ScanPages[q] = NULL; }
+            ScannedObjectCount = 0;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Called from mqtt_state_task's existing 45s loop - no new task. Never runs
+   while a scan is in progress. */
+static void scan_catalog_release_if_idle(void)
+{
+    if (!scan_catalog_present() || ScanState == SCAN_STATE_RUNNING) {
+        return;
+    }
+    if (ScanCatalogLastUseUs == 0) {
+        return;
+    }
+    int64_t idle_ms = (esp_timer_get_time() - ScanCatalogLastUseUs) / 1000;
+    if (idle_ms < SCAN_CATALOG_IDLE_MS) {
+        return;
+    }
+    for (size_t p = 0; p < SCAN_PAGE_COUNT; p++) { free(ScanPages[p]); ScanPages[p] = NULL; }
+    ScannedObjectCount = 0;
+    ScanCatalogLastUseUs = 0;
+    if (ScanState == SCAN_STATE_COMPLETE) {
+        ScanState = SCAN_STATE_IDLE;
+    }
+    diag_log("object catalog released after idle - %uB back", (unsigned)(MAX_SCANNED_OBJECTS * sizeof(scanned_object_t)));
+}
+
 static void object_scan_task(void *arg)
 {
     (void)arg;
@@ -2890,7 +3551,8 @@ static void object_scan_task(void *arg)
         ScanState = SCAN_STATE_ERROR;
         snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "BACnet datalink not ready");
         ScanTaskHandle = NULL;
-        vTaskDelete(NULL);
+        task_registry_remove_self();
+    vTaskDelete(NULL);
         return;
     }
 
@@ -2911,6 +3573,9 @@ static void object_scan_task(void *arg)
 
     size_t found = 0;
     for (uint32_t idx = 1; idx <= total && found < MAX_SCANNED_OBJECTS; idx++) {
+        if (!scan_catalog_present()) { /* released underneath us - stop cleanly */
+            break;
+        }
         uint16_t obj_type = 0;
         uint32_t obj_inst = 0;
         bool got_id = false;
@@ -2939,12 +3604,16 @@ static void object_scan_task(void *arg)
                 xSemaphoreGive(BacnetMutex);
             }
 
-            ScannedObjects[found].type = obj_type;
-            ScannedObjects[found].instance = obj_inst;
+            scanned_object_t *slot = scan_obj(found);
+            if (!slot) {
+                break;
+            }
+            slot->type = obj_type;
+            slot->instance = obj_inst;
             if (strlen(name_buf) > 0) {
-                strlcpy(ScannedObjects[found].name, name_buf, sizeof(ScannedObjects[found].name));
+                strlcpy(slot->name, name_buf, sizeof(slot->name));
             } else {
-                snprintf(ScannedObjects[found].name, sizeof(ScannedObjects[found].name), "%s #%u",
+                snprintf(slot->name, sizeof(slot->name), "%s #%u",
                          bactext_object_type_name_default(obj_type, "obj"), (unsigned)obj_inst);
             }
             found++;
@@ -2952,12 +3621,13 @@ static void object_scan_task(void *arg)
         }
 
         ScanCurrent = idx;
-        ScanPercent = (uint8_t)((idx * 100) / total);
+        ScanPercent = total ? (uint8_t)((idx * 100) / total) : 0;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
     ScanState = SCAN_STATE_COMPLETE;
     ScanTaskHandle = NULL;
+    task_registry_remove_self();
     vTaskDelete(NULL);
 }
 
@@ -2968,11 +3638,41 @@ static esp_err_t api_objects_scan_start_handler(httpd_req_t *req)
         httpd_resp_send(req, "{\"ok\":true,\"status\":\"already_running\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
+    if (!scan_catalog_acquire()) {
+        /* 34.5KB contiguous is a big ask on this board. Fail the one endpoint
+           loudly rather than starving the device. */
+        diag_log("object catalog alloc failed - %uB contiguous unavailable",
+                 (unsigned)(MAX_SCANNED_OBJECTS * sizeof(scanned_object_t)));
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req,
+            "{\"ok\":false,\"error\":\"insufficient memory for the object catalog - "
+            "reboot the bridge and retry the scan before opening other pages\"}",
+            HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
     ScanState = SCAN_STATE_RUNNING;
     ScanCurrent = 0;
     ScanPercent = 0;
     ScannedObjectCount = 0;
-    xTaskCreate(object_scan_task, "obj_scan", 8192, NULL, 5, &ScanTaskHandle);
+    /* 24576, was 8192. This task walks the controller's object-list issuing a
+       ReadProperty per object, which is the same nested MAX_APDU=1476 path
+       that bacnet_client_task needs 24576 for and that measures at ~18KB peak
+       in the HTTP handlers. At 8192 it could never complete a scan: triggering
+       one on 2026-08-25 gave "***ERROR*** A stack overflow in task obj_scan"
+       followed by an IntegerDivideByZero panic on the corrupted stack. The
+       task is transient - created per scan, deleted at the end - so this is
+       borrowed for the duration of a scan, not held. */
+    if (!spawn_task(object_scan_task, "obj_scan", 24576, NULL, 5, &ScanTaskHandle)) {
+        /* Unchecked before: a failed create left ScanState at RUNNING and the
+           scan hung at state=scanning forever with no error surfaced. */
+        ScanState = SCAN_STATE_ERROR;
+        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "no memory for scan task");
+        diag_log("obj_scan task create failed - scan aborted");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"insufficient memory to start the scan\"}",
+                        HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true,\"status\":\"started\"}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -3002,6 +3702,15 @@ static const httpd_uri_t api_objects_scan_status_uri = {
 static esp_err_t api_objects_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
+    if (!scan_catalog_present()) {
+        /* Released after idle, or never scanned this boot. Either way the
+           catalog has to be rebuilt - it is not persisted. */
+        httpd_resp_send(req,
+            "{\"ok\":true,\"count\":0,\"released\":true,\"objects\":[]}",
+            HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    ScanCatalogLastUseUs = esp_timer_get_time(); /* keep it alive while browsing */
     char chunk[512];
     int len = snprintf(chunk, sizeof(chunk), "{\"ok\":true,\"count\":%u,\"objects\":[", (unsigned)ScannedObjectCount);
     httpd_resp_send_chunk(req, chunk, len);
@@ -3009,16 +3718,18 @@ static esp_err_t api_objects_get_handler(httpd_req_t *req)
     /* 64-char name * worst-case 2x escaping (every char is '"' or '\\') + slack */
     char name_escaped[129];
     for (size_t i = 0; i < ScannedObjectCount; i++) {
-        json_escape(name_escaped, ScannedObjects[i].name, sizeof(name_escaped));
-        const char *tname = bactext_object_type_name_default(ScannedObjects[i].type, "unknown");
-        bool writable = (ScannedObjects[i].type == OBJECT_ANALOG_VALUE ||
-                          ScannedObjects[i].type == OBJECT_BINARY_VALUE ||
-                          ScannedObjects[i].type == OBJECT_MULTI_STATE_VALUE ||
-                          ScannedObjects[i].type == OBJECT_ANALOG_OUTPUT ||
-                          ScannedObjects[i].type == OBJECT_BINARY_OUTPUT ||
-                          ScannedObjects[i].type == OBJECT_MULTI_STATE_OUTPUT);
+        const scanned_object_t *o = scan_obj(i);
+        if (!o) break;
+        json_escape(name_escaped, o->name, sizeof(name_escaped));
+        const char *tname = bactext_object_type_name_default(o->type, "unknown");
+        bool writable = (o->type == OBJECT_ANALOG_VALUE ||
+                          o->type == OBJECT_BINARY_VALUE ||
+                          o->type == OBJECT_MULTI_STATE_VALUE ||
+                          o->type == OBJECT_ANALOG_OUTPUT ||
+                          o->type == OBJECT_BINARY_OUTPUT ||
+                          o->type == OBJECT_MULTI_STATE_OUTPUT);
         len = snprintf(chunk, sizeof(chunk), "%s{\"type\":\"%s\",\"instance\":%u,\"name\":\"%s\",\"writable\":%s}",
-                       i == 0 ? "" : ",", tname, (unsigned)ScannedObjects[i].instance, name_escaped,
+                       i == 0 ? "" : ",", tname, (unsigned)o->instance, name_escaped,
                        writable ? "true" : "false");
         httpd_resp_send_chunk(req, chunk, len);
     }
@@ -3247,6 +3958,20 @@ static const httpd_uri_t api_objects_batch_uri = {
 
 static esp_mqtt_client_handle_t MqttClient = NULL;
 static volatile bool MqttConnected = false;
+/* Link-liveness signal for mqtt_state_task's watchdog check below - set when
+   MQTT_EVENT_DISCONNECTED fires, cleared on MQTT_EVENT_CONNECTED. 0 = not
+   currently down. Deliberately NOT a dedicated esp_ping-based check: that
+   approach (tried 2026-08-23, reverted same day) spawned a task per check and
+   pushed this no-PSRAM board's heap from 15K into a 2K reboot loop. Piggybacking
+   on MQTT's own connect state costs one int64 and a few lines inside an
+   already-running task - no new task, no new heap allocation. */
+static volatile int64_t MqttDisconnectedSinceUs = 0;
+static volatile int64_t MqttWatchdogLastKickUs = 0;
+static volatile int64_t MqttRecycleLastUs = 0;
+/* Release the MQTT client's own heap after this long unconnected, well before
+   the 3-minute link watchdog gives up on WiFi entirely. */
+#define MQTT_RECYCLE_AFTER_MS (45 * 1000)
+#define MQTT_WATCHDOG_RECONNECT_MS (3 * 60 * 1000)
 
 static char MqttBrokerHost[64] = "";
 static uint16_t MqttBrokerPort = 1883;
@@ -3464,6 +4189,13 @@ static void parse_custom_mqtt_from_json(const char *body)
 
 #define NVS_KEY_BOOST_TIMEOUT "boost_min"
 #define NVS_KEY_BOOST_EXTERNAL "boost_ext"
+/* mDNS advertisement. Default OFF and deliberately so: an always-on responder
+   cost ~3-5K of heap on this no-PSRAM board, which was the reason it was cut
+   in the first place. Existing installations have no such key in NVS, so they
+   read as disabled and stay disabled. Note this governs only the *service
+   advertisement* (.local hostname); the transient mdns_query_ptr() used to
+   discover MQTT brokers in the wizard is unaffected and always available. */
+#define NVS_KEY_MDNS_ENABLED "mdns_en"
 
 static void app_config_load(void)
 {
@@ -3480,6 +4212,17 @@ static void app_config_load(void)
     if (nvs_get_u8(handle, NVS_KEY_BOOST_EXTERNAL, &external) == ESP_OK) {
         BoostRevertExternal = external != 0;
     }
+    /* Initialised, and only an explicit 1 enables it. On the first boot of the
+       firmware that introduced this key the device came up advertising despite
+       no prior firmware ever having written it - cause not established, so
+       this path is deliberately defensive: an uninitialised read cannot leak
+       through, and any value that is not exactly 1 leaves mDNS off. */
+    uint8_t mdns_en = 0;
+    if (nvs_get_u8(handle, NVS_KEY_MDNS_ENABLED, &mdns_en) == ESP_OK) {
+        MdnsEnabled = (mdns_en == 1);
+    } else {
+        MdnsEnabled = false;
+    }
     nvs_close(handle);
 }
 
@@ -3491,6 +4234,7 @@ static void app_config_save(void)
     }
     nvs_set_u16(handle, NVS_KEY_BOOST_TIMEOUT, BoostTimeoutMinutes);
     nvs_set_u8(handle, NVS_KEY_BOOST_EXTERNAL, BoostRevertExternal ? 1 : 0);
+    nvs_set_u8(handle, NVS_KEY_MDNS_ENABLED, MdnsEnabled ? 1 : 0);
     nvs_commit(handle);
     nvs_close(handle);
 }
@@ -4186,7 +4930,7 @@ static esp_err_t api_mqtt_entities_get_handler(httpd_req_t *req)
     }
     if (h_ret_ok && temp_is_plausible(h_ret) && sa_cnt > 0) {
         float avg_sa = sa_sum / sa_cnt;
-        float dt = (strcmp(hmode, "heating") == 0) ? (avg_sa - h_ret) : (h_ret - avg_sa);
+        float dt = avg_sa - h_ret; /* signed: negative = cooling, positive = warming */
         snprintf(v_delta, sizeof(v_delta), "%.1f°C", dt);
     } else {
         snprintf(v_delta, sizeof(v_delta), "Unavailable");
@@ -4756,7 +5500,7 @@ static esp_err_t api_config_import_handler(httpd_req_t *req)
     /* If we were in SoftAP mode or WiFi credentials changed, a reboot joins the restored network */
     if (has_wifi_update || StaIp[0] == '\0') {
         reboot_required = true;
-        xTaskCreate(delayed_reboot_task, "delay_reboot", 2048, NULL, 5, NULL);
+        spawn_task(delayed_reboot_task, "delay_reboot", 2048, NULL, 5, NULL);
     }
 
     char resp[128];
@@ -4837,8 +5581,22 @@ static httpd_handle_t start_connected_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_open_sockets = 13;
+    /* 13 -> 8. Each open socket costs lwIP control blocks and an httpd table
+       slot. The dashboard opens a handful at a time; 13 was sized for headroom
+       this board does not have (measured 3-12K free heap with everything up). */
+    config.max_open_sockets = 8;
     config.lru_purge_enable = true;
+    /* Restored to 24576 on 2026-08-24. The 2026-08-23 trim to 16384 (to save
+       8KB of fixed heap on this no-PSRAM board) was too aggressive: loading
+       /api/status followed by /api/bacnet/read reliably panicked with
+       "***ERROR*** A stack overflow in task httpd has been detected."
+       The comment then said to "watch for stack-overflow panics ... and raise
+       it back if so" - this is that. The BACnet read path nests MAX_APDU=1476
+       buffers across bip_receive/rp_ack_decode/bacapp_decode, which is exactly
+       why bacnet_client_task also gets 24576; a handler doing ~20 of those
+       sequentially needs comparable headroom. The `done` diag_log lines now
+       report this task's stack high-water mark so the real margin is
+       measurable instead of guessed - tune from that, not from intuition. */
     config.stack_size = 24576;
     config.max_uri_handlers = 55;
 
@@ -4860,6 +5618,8 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &api_system_power_uri);
         httpd_register_uri_handler(server, &api_boost_uri);
         httpd_register_uri_handler(server, &api_boost_timeout_uri);
+        httpd_register_uri_handler(server, &api_device_mdns_uri);
+        httpd_register_uri_handler(server, &api_debug_stacks_uri);
         httpd_register_uri_handler(server, &api_bacnet_read_uri);
         httpd_register_uri_handler(server, &api_bacnet_write_uri);
         httpd_register_uri_handler(server, &api_wifi_reset_uri);
@@ -4895,7 +5655,10 @@ static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_open_sockets = 13;
+    /* 13 -> 8. Each open socket costs lwIP control blocks and an httpd table
+       slot. The dashboard opens a handful at a time; 13 was sized for headroom
+       this board does not have (measured 3-12K free heap with everything up). */
+    config.max_open_sockets = 8;
     config.lru_purge_enable = true;
     config.stack_size = 24576;
     config.max_uri_handlers = 25;
@@ -4907,6 +5670,8 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &connect_uri);
         httpd_register_uri_handler(server, &wizard_page_uri);
         httpd_register_uri_handler(server, &api_network_uri);
+        /* Setup flow exposes the mDNS toggle on the WiFi page (root.html). */
+        httpd_register_uri_handler(server, &api_device_mdns_uri);
         httpd_register_uri_handler(server, &api_bacnet_discover_uri);
         httpd_register_uri_handler(server, &api_strategy_inspect_uri);
         httpd_register_uri_handler(server, &api_rooms_get_uri);
@@ -5519,7 +6284,10 @@ static void mqtt_event_handler(
     switch (event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG_WIFI, "MQTT connected to broker");
+            diag_log("mqtt connected");
             MqttConnected = true;
+            MqttDisconnectedSinceUs = 0;
+            MqttWatchdogLastKickUs = 0;
             {
                 char st_top[96];
                 snprintf(st_top, sizeof(st_top), "%s/status", MqttTopicBase);
@@ -5530,7 +6298,11 @@ static void mqtt_event_handler(
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG_WIFI, "MQTT disconnected");
+            diag_log("mqtt disconnected");
             MqttConnected = false;
+            if (MqttDisconnectedSinceUs == 0) {
+                MqttDisconnectedSinceUs = esp_timer_get_time();
+            }
             break;
         case MQTT_EVENT_DATA: {
             mqtt_command_t cmd = {0};
@@ -5559,6 +6331,24 @@ static void mqtt_command_task(void *arg)
     }
 }
 
+/* Called from sta_event_handler() on the sys_evt task, so this must not
+   block. esp_mqtt_client_disconnect()/_reconnect() only flag the client's own
+   task; esp_mqtt_client_stop() would block waiting for it to wind down, which
+   is not safe from an event handler. */
+static void mqtt_pause_for_link_loss(void)
+{
+    if (MqttClient) {
+        esp_mqtt_client_disconnect(MqttClient);
+    }
+}
+
+static void mqtt_resume_after_link_up(void)
+{
+    if (MqttClient) {
+        esp_mqtt_client_reconnect(MqttClient);
+    }
+}
+
 static void mqtt_app_restart(void)
 {
     if (MqttClient) {
@@ -5580,7 +6370,22 @@ static void mqtt_app_restart(void)
             .session.last_will.msg_len = 0,
             .session.last_will.qos = 1,
             .session.last_will.retain = true,
-            .task.stack_size = 24576,
+            /* Bound the outbox. Unset it defaults to unlimited, so every
+               publish attempted while the broker is unreachable queues in
+               heap. Observed 2026-08-24: "outbox_enqueue(53): Memory
+               exhausted" with free heap at 3-5K. 4KB is ample for this
+               device's publish volume between reconnects. */
+            .outbox.limit = 4096,
+            /* 8192, was 24576. This is esp-mqtt's own protocol task - it runs
+               the MQTT state machine and our mqtt_event_handler, and never
+               touches the BACnet read path (that is mqtt_state_task and
+               mqtt_command_task, which do legitimately need 24K for nested
+               MAX_APDU buffers). esp-mqtt's default is 6144. At 24576 this
+               device had four 24K stacks committed out of ~185K total heap,
+               which left only 19.5K free - not enough for bacnet_client_task's
+               own 24K, so BACnet silently never started. 8192 keeps a
+               comfortable margin over the default while freeing 16K. */
+            .task.stack_size = 8192,
         };
         if (strlen(MqttBrokerUser) > 0) {
             mqtt_cfg.credentials.username = MqttBrokerUser;
@@ -5596,7 +6401,7 @@ static void mqtt_app_start(void)
 {
     if (!MqttCommandQueue) {
         MqttCommandQueue = xQueueCreate(8, sizeof(mqtt_command_t));
-        xTaskCreate(mqtt_command_task, "mqtt_command", 24576, NULL, 5, NULL);
+        spawn_task(mqtt_command_task, "mqtt_command", 24576, NULL, 5, NULL);
     }
     mqtt_app_restart();
 }
@@ -5605,6 +6410,45 @@ static void mqtt_state_task(void *arg)
 {
     (void)arg;
     for (;;) {
+        /* Link-liveness watchdog: catches the AP silently dropping the client
+           without a deauth (see the diagnostics comment near app_main) - MQTT
+           unable to even open a TCP connection for minutes straight, despite
+           the WiFi driver still reporting "connected", is the same dead-link
+           condition as an explicit disconnect. Force one the same way a real
+           disconnect event would. No new task, no esp_ping - see the comment
+           on MqttDisconnectedSinceUs for why that matters on this board. */
+        if (!MqttConnected && MqttDisconnectedSinceUs != 0) {
+            int64_t now = esp_timer_get_time();
+            int64_t down_ms = (now - MqttDisconnectedSinceUs) / 1000;
+            int64_t since_last_kick_ms = (now - MqttWatchdogLastKickUs) / 1000;
+            /* Stage 1: recycle the MQTT client itself. A broker unreachable
+               while WiFi still reports "connected" leaves esp-mqtt retrying
+               indefinitely, and the in-flight esp-tls contexts plus the outbox
+               pin heap - measured at 3-5K free on 2026-08-24, at which point
+               the HTTP server could no longer allocate a response and the
+               device was unreachable despite being associated (AP-side
+               Assoc rssi:-73, no deauth in that window). The WiFi-disconnect
+               path frees this, but only fires on an actual disconnect event,
+               which never came. Stop/destroy/re-init releases all of it.
+               Stage 2 below still forces the WiFi reconnect if that is not
+               enough. */
+            if (down_ms > MQTT_RECYCLE_AFTER_MS &&
+                (MqttRecycleLastUs == 0 || (now - MqttRecycleLastUs) / 1000 > MQTT_RECYCLE_AFTER_MS)) {
+                MqttRecycleLastUs = now;
+                diag_log("mqtt down %llds - recycling client to release heap",
+                    (long long)(down_ms / 1000));
+                mqtt_app_restart();
+            }
+            if (down_ms > MQTT_WATCHDOG_RECONNECT_MS &&
+                (MqttWatchdogLastKickUs == 0 || since_last_kick_ms > MQTT_WATCHDOG_RECONNECT_MS)) {
+                MqttWatchdogLastKickUs = now;
+                diag_log("mqtt unreachable %llds despite wifi appearing connected - forcing reconnect",
+                    (long long)(down_ms / 1000));
+                esp_wifi_disconnect(); /* fires WIFI_EVENT_STA_DISCONNECTED -> normal reconnect path */
+            }
+        }
+        scan_catalog_release_if_idle();
+
         if (MqttConnected) {
             if (DiscoveryNeedsBacnetRefresh) {
                 mqtt_publish_discovery();
@@ -5614,6 +6458,13 @@ static void mqtt_state_task(void *arg)
             }
         }
         if (MqttConnected && BacnetReady) {
+            /* Timing bracket added 2026-08-23 to test whether WiFi RSSI drops
+               correlate with this loop's ~20-property BACnet/SPI read burst
+               (the W5500 shares the board with the WiFi antenna over an
+               unshielded 3-4" run - a plausible RFI source). Same pattern as
+               the httpd handler timing added the same night. */
+            int64_t __bacnet_burst_start_us = esp_timer_get_time();
+            diag_log("bacnet poll burst start");
             bool sys_power;
             if (read_bool_property(
                     OBJECT_BINARY_VALUE, SYS_POWER_READBACK_INSTANCE, PROP_PRESENT_VALUE, &sys_power)) {
@@ -5784,7 +6635,7 @@ static void mqtt_state_task(void *arg)
                 }
                 if (h_ret_ok && temp_is_plausible(h_ret) && sa_cnt > 0) {
                     float avg_sa = sa_sum / sa_cnt;
-                    float dt = is_heating ? (avg_sa - h_ret) : (h_ret - avg_sa);
+                    float dt = avg_sa - h_ret; /* signed: negative = cooling, positive = warming */
                     snprintf(hpayload, sizeof(hpayload), "%.1f", dt);
                     snprintf(htop, sizeof(htop), "%s/health/air_delta/state", MqttTopicBase);
                     esp_mqtt_client_publish(MqttClient, htop, hpayload, 0, 1, true);
@@ -5812,24 +6663,92 @@ static void mqtt_state_task(void *arg)
                     }
                 }
             }
+            diag_log("bacnet poll burst done %lldms",
+                (long long)((esp_timer_get_time() - __bacnet_burst_start_us) / 1000));
         }
-        vTaskDelay(pdMS_TO_TICKS(20000));
+        /* 45s (was 20s) - 2026-08-23, less frequent BACnet polling to cut heap
+           churn per Piers's request. This loop does ~20 sequential BACnet
+           reads + MQTT publishes every cycle; halving the frequency roughly
+           halves its share of steady-state CPU/heap pressure. */
+        vTaskDelay(pdMS_TO_TICKS(45000));
     }
 }
 
+/* ===================== Diagnostics: serial debug log =====================
+   Added 2026-08-23 after a device disappeared from HA/MQTT and stopped answering ping.
+   Originally also shipped every line over UDP to a Pi listener so this was diagnosable
+   without a USB cable attached - removed same day at Piers's request, to take wireless
+   activity (a socket, sendto() calls, DNS/getaddrinfo on the broker host) off the table
+   as a variable while diagnosing a WiFi RSSI/RF issue. diag_log() now only writes to the
+   serial console (already true of every ESP_LOGx call); a laptop with a USB-serial
+   adapter tailing the port is the only way to read it. See serial_logger.py in the repo's
+   working notes / docs for a simple local capture-to-file script if wanted. */
+static void diag_log(const char *fmt, ...)
+{
+    char msg[128];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+
+    uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000LL);
+    /* Total free AND largest contiguous block. Total alone is misleading: on
+       2026-08-25 a 24576-byte task stack failed to allocate with 33K free,
+       because fragmentation had left no single block big enough. The `big=`
+       figure is the one that actually predicts allocation failures. */
+    size_t freeb = heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    size_t bigb = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    ESP_LOGW("DIAG", "esp-bacnet up=%us heap=%uK big=%uK %s",
+             (unsigned)up, (unsigned)(freeb / 1024), (unsigned)(bigb / 1024), msg);
+}
+
+/* Gateway-liveness watchdog (esp_ping-based, spawned a task per check + its own
+   4KB task stack) was cut same-day: on this no-PSRAM, ~185K-heap board it pushed
+   free heap from ~15K to a 2K reboot-loop within 90s of boot - the exact crisis
+   documented in the heap-budget incident history. diag_log() below is cheap
+   (no new task, one UDP socket) and stays. A lighter liveness check - piggybacked
+   on an existing task, no esp_ping - is future work if the WiFi/PS fix above
+   doesn't fully resolve the silent-association-drop failure mode on its own. */
+
 /* ===================== app_main ===================== */
 
-#define MDNS_HOSTNAME "esp-bacnet-bridge"
 
 static void mdns_start_service(void)
 {
+    if (MdnsRunning) {
+        return;
+    }
     if (mdns_init() != ESP_OK) {
+        ESP_LOGW(TAG_WIFI, "mDNS init failed - continuing without .local");
         return;
     }
     mdns_hostname_set(MDNS_HOSTNAME);
     mdns_instance_name_set("ESP32 BACnet Bridge");
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+    MdnsRunning = true;
+    diag_log("mdns advertisement started (%s.local)", MDNS_HOSTNAME);
     ESP_LOGI(TAG_WIFI, "mDNS ready - reachable at http://%s.local", MDNS_HOSTNAME);
+}
+
+static void mdns_stop_service(void)
+{
+    if (!MdnsRunning) {
+        return;
+    }
+    mdns_free();
+    MdnsRunning = false;
+    diag_log("mdns advertisement stopped");
+    ESP_LOGI(TAG_WIFI, "mDNS stopped");
+}
+
+/* Bring the responder in line with MdnsEnabled. Safe to call repeatedly. */
+static void mdns_apply_setting(void)
+{
+    if (MdnsEnabled) {
+        mdns_start_service();
+    } else {
+        mdns_stop_service();
+    }
 }
 
 void app_main(void)
@@ -5858,17 +6777,35 @@ void app_main(void)
 
     BacnetMutex = xSemaphoreCreateMutex();
 
-    xTaskCreate(eth_bringup_task, "eth_bringup", 4096, NULL, 5, NULL);
+    spawn_task(eth_bringup_task, "eth_bringup", 4096, NULL, 5, NULL);
 
     char ssid[33] = {0};
     char pass[65] = {0};
     if (load_wifi_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
         if (try_connect_sta(ssid, pass)) {
             ESP_LOGI(TAG_WIFI, "Connected to '%s' - provisioning not needed this boot", ssid);
-            mdns_start_service();
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            /* mDNS costs ~3-5K heap at boot - on this no-PSRAM, ~185K-heap device that's
+               the difference between stable and a reboot loop (see esp32-heap-budget-no-psram
+               memory / docs/SCOPE_2026-08-16_baseline-revert.md). Baseline never got the
+               runtime toggle that later work added; cutting it outright is the simplest
+               isolated fix. Device is DHCP-reserved (192.168.1.216) so .local access isn't
+               needed. Re-add mdns_start_service() deliberately, with the NVS-backed toggle,
+               if .local access is ever wanted again - don't re-enable unconditionally. */
             start_connected_webserver();
+            /* Advertisement is opt-in and off by default - see NVS_KEY_MDNS_ENABLED.
+               Toggleable from the setup wizard and the Update page. */
+            mdns_apply_setting();
             mqtt_app_start();
-            xTaskCreate(mqtt_state_task, "mqtt_state", 24576, NULL, 5, NULL);
+            /* 16384, was 24576. Measured via /api/debug/stacks under real
+               workload: peak use 10,356 B, so this leaves ~6 KB of margin and
+               returns 8,192 B to the heap. Deliberately NOT applied to
+               mqtt_command - its measured peak of 752 B is unrepresentative
+               because that task only runs when Home Assistant sends an MQTT
+               command, and its real workload is the BACnet write path.
+               Trimming that one on an unexercised number is exactly how the
+               httpd stack ended up 1,772 B short and crashing. */
+            spawn_task(mqtt_state_task, "mqtt_state", 16384, NULL, 5, NULL);
             return;
         }
     } else {

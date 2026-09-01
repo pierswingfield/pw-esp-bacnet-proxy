@@ -9,3 +9,8 @@ otadata,  data, ota,     ,        0x2000,
 phy_init, data, phy,     ,        0x1000,
 ota_0,    app,  ota_0,   ,        1900K,
 ota_1,    app,  ota_1,   ,        1900K,
+# Panic backtrace + register state written to flash, survives reboot and needs
+# no USB tether. Added 2026-08-24: the board runs headless in a wall enclosure,
+# so before this a crash left nothing behind but esp_reset_reason(). 64K sits
+# in the ~148K of flash left free after ota_1.
+coredump, data, coredump, ,      64K,

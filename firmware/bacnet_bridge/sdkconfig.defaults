@@ -43,3 +43,14 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_MQTT_TRANSPORT_SSL=n
 CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
 CONFIG_MQTT_TRANSPORT_WEBSOCKET_SECURE=n
+
+# Panic backtrace to flash - the board runs headless, so a crash previously
+# left nothing but a reset reason. Needs the `coredump` partition.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=32
+
+# sys_evt overflowed its 2304-byte stack on 2026-08-23 mid-way through a
+# diag_log() call in the WiFi disconnect handler (log line truncated at "DIA").
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096

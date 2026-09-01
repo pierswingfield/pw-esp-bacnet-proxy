@@ -68,6 +68,19 @@
     <button type="button" class="danger full-width" id="fwUploadBtn">Upload &amp; Install</button>
     <p class="note" id="fwNote"></p>
 
+    <h2>Network Discovery (mDNS)</h2>
+    <p class="note">
+      When on, the bridge advertises itself on your network so you can reach it at
+      <code id="mdnsHost">esp-bacnet-bridge.local</code> instead of by IP address.
+      Off by default: the responder holds a few KB of memory permanently, and this
+      board has none to spare. Leave it off unless you actually need <code>.local</code>.
+    </p>
+    <label style="display:flex; align-items:center; gap:0.6em; margin:0.8em 0; cursor:pointer;">
+      <input type="checkbox" id="mdnsToggle" style="width:auto; margin:0;">
+      <span>Advertise this bridge on the network</span>
+    </label>
+    <p class="note" id="mdnsNote"></p>
+
     <h2>Backup &amp; Restore Configuration</h2>
     <p class="note">
       Export a complete snapshot of this bridge's configuration (BACnet target, custom room assignments,
@@ -86,6 +99,40 @@
     <p class="note" id="cfgNote"></p>
 
     <script>
+      // mDNS advertisement toggle - reflects and sets the saved setting.
+      (function () {
+        var box = document.getElementById('mdnsToggle');
+        var note = document.getElementById('mdnsNote');
+        var host = document.getElementById('mdnsHost');
+        fetch('/api/network').then(function (r) { return r.json(); }).then(function (d) {
+          box.checked = !!d.mdns_enabled;
+          if (d.mdns_hostname) { host.textContent = d.mdns_hostname; }
+        }).catch(function () { note.textContent = 'Could not read the current setting.'; });
+
+        box.addEventListener('change', function () {
+          var want = box.checked;
+          note.textContent = 'Saving...';
+          fetch('/api/device/mdns', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'value=' + (want ? 'on' : 'off')
+          }).then(function (r) { return r.json(); }).then(function (d) {
+            if (d.ok) {
+              box.checked = !!d.mdns_enabled;
+              note.textContent = d.mdns_enabled
+                ? 'On. Reachable at ' + d.hostname + ' once your network picks it up.'
+                : 'Off. Reach the bridge by its IP address.';
+            } else {
+              box.checked = !want;
+              note.textContent = d.error || 'Could not change the setting.';
+            }
+          }).catch(function () {
+            box.checked = !want;
+            note.textContent = 'Could not reach the bridge.';
+          });
+        });
+      })();
+
       // Firmware OTA
       document.getElementById('fwUploadBtn').addEventListener('click', function() {
         var input = document.getElementById('fwFile');
