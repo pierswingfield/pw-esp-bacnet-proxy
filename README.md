@@ -160,6 +160,24 @@ Validate both clean profile builds before a release (after sourcing ESP-IDF):
 tools/validate_build_profiles.sh
 ```
 
+### Publishing a T-ETH-Lite OTA release
+
+The GitHub Update page reads `releases/t-eth-lite.json`; do not edit its image
+URL or checksum by hand. After bumping `project(... VERSION X.Y.Z)` in
+`firmware/bacnet_bridge/CMakeLists.txt`, validating both profiles and merging
+the change to `master`, create and push an annotated tag in this exact form:
+
+```bash
+git tag -a vX.Y.Z-t-eth-lite -m "T-ETH-Lite X.Y.Z OTA release"
+git push origin vX.Y.Z-t-eth-lite
+```
+
+The `Publish T-ETH-Lite OTA release` GitHub workflow builds the T-ETH-Lite
+profile in ESP-IDF 5.3.1, rejects a tag/version mismatch, uploads the OTA
+binary to the GitHub release, calculates its SHA-256, and commits the live
+manifest back to `master`. The browser then exposes its changelog and download
+only to compatible, older T-ETH-Lite firmware.
+
 ### 2. Physical Installation
 1. Mount the selected Ethernet hardware inside or near the FCU controller enclosure.
 2. Connect power via USB-C.
