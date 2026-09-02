@@ -564,24 +564,15 @@ their own stacks. Use bounded waits/task notifications or static semaphores,
 make queue pressure observable, and avoid heap allocation per request. Then
 resize HTTP/MQTT stacks from measured high-water marks.
 
-### Outstanding work before release
+### Remaining release acceptance
 
-- Complete the full Stage 6 matrix: 20 cold and 20 warm boots (the proof's 20
-  warm/10 cold observations are preliminary), Ethernet and Wi-Fi recovery,
-  one-hour broker outage, full object scan during MQTT/dashboard load, good and
-  deliberately failing OTA rollback, 24-hour development soak and 72-hour
-  release-candidate soak.
-- Require zero unexpected resets, panics or coredumps, no downward heap trend,
-  and adequate largest-block margin throughout.
-- Repeat the RF dose-response test with Ethernet linked.
-- Complete the component split and OTA-validity/rollback changes described in
-  Stages 2-4; the minimal Stage 1 port does not itself constitute the planned
-  rearchitecture.
-- Increase bootloader growth margin from the recorded 0x730 bytes when the
-  partition/OTA work is undertaken.
-- Fix the mDNS-dependent post-Wi-Fi completion text in the backlog above.
-- Update all affected documentation and run both T-ETH and W5500 builds before
-  committing. Do not claim feature/stability parity from a clean build alone.
+The original architectural migration is complete; the remaining work is live
+release acceptance rather than a planned rewrite. Before calling a firmware
+release production-ready, run the target-specific manual matrix: repeated cold
+and warm boot/recovery, full object scan under MQTT/dashboard load, a genuine
+LAN OTA update plus deliberate rollback test, and the 24-hour development /
+72-hour release-candidate soaks. A clean build is mechanical evidence only;
+record device telemetry, resets and largest-block margin from the live target.
 
 Do not erase the whole flash or NVS during the next test, power the target from
 both boards, connect both bridges to the Delta segment, or revert to the

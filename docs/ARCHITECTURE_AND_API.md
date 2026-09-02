@@ -273,14 +273,19 @@ Triggers a BACnet controller discovery scan.
   }
   ```
 
-#### `GET /api/scan/objects?offset=0&limit=50`
-Scans BACnet objects on the target controller in paginated chunks.
+#### `POST /api/objects/scan-start`
+Starts a full object-list scan. The optional commissioning worker and its
+temporary catalog are allocated from PSRAM on T-ETH-Lite, so it does not take
+the internal RAM needed by Wi-Fi, HTTP or BACnet control. Returns a clear
+Ethernet-link error without starting a scan when BACnet Ethernet is unplugged.
 
-#### `GET /api/catalog`
-Returns the cached BACnet object catalog and pinned points.
+#### `GET /api/objects/scan-status`
+Returns scan state, progress, object count and any error.
 
-#### `POST /api/catalog/pin`
-Pins or unpins an object in the browser catalog.
+#### `GET /api/objects`
+Returns the in-memory catalog after a successful scan. The catalog expires
+after ten minutes of inactivity. `tools/bacnet_object_scan.py` runs these
+endpoints from a workstation and saves the result as JSON.
 
 ---
 
@@ -300,6 +305,11 @@ Restores device configuration from an uploaded JSON payload.
 
 #### `POST /api/ota`
 Accepts binary firmware images for OTA update. Requires HTTP Basic Authentication (`admin:<OtaPassword>`).
+
+#### `GET /api/version`
+Returns the installed semantic firmware version and board profile. The Update
+page compares it with the T-ETH-Lite GitHub release manifest and displays the
+published changelog and release download when a newer compatible image exists.
 
 ---
 

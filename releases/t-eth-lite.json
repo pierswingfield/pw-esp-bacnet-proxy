@@ -1,0 +1,12 @@
+{
+  "board": "t-eth-lite",
+  "version": "0.3.0",
+  "published_at": "2026-09-02",
+  "image_url": "",
+  "sha256": "",
+  "changelog": [
+    "T-ETH-Lite is the primary hardware profile.",
+    "Health and status pages report an unplugged BACnet Ethernet link immediately.",
+    "Object discovery uses PSRAM and can be exported through the HTTP API CLI."
+  ]
+}

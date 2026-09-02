@@ -78,9 +78,9 @@ This project was built from deep on-wire discovery and protocol analysis of the 
 - **Captive Portal First-Boot**: Zero-app setup. On first boot, connects to `ESP-BACnet-Setup` SoftAP to configure home WiFi.
 - **On-Device Web Setup Wizard**: Guides target discovery, room selection, and MQTT broker setup.
 - **Home Assistant Auto-Discovery**: Provisions full `climate` entities for every configured room zone, system power toggles, boost mode controls, and individual temperature sensors over MQTT.
-- **Dynamic Object Browser & Scanner**: Live on-wire BACnet object browser capable of scanning 400+ objects with paginated UX and pin/unpin controls.
+- **Dynamic Object Browser & Scanner**: Live on-wire BACnet object browser capable of scanning 400+ objects; the T-ETH-Lite scan worker and temporary catalog use PSRAM, and `tools/bacnet_object_scan.py` exports its JSON catalog from a workstation.
 - **Circular In-Memory Logs Console**: Real-time diagnostic console accessible from the Web UI (`/health`) showing live BACnet transactions and network events.
-- **Rollback-Protected LAN OTA Updates**: Password-protected web OTA update with dual 1900KB app partitions and automatic bootloader rollback safety.
+- **Rollback-Protected LAN OTA Updates**: Password-protected web OTA update with dual 1900KB app partitions, automatic bootloader rollback safety, and a GitHub release-manifest check with published changelog/download handoff.
 - **Configuration Backup & Restore**: Export and import complete device configuration as a single JSON file.
 
 ## Stability builds

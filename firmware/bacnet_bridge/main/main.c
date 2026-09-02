@@ -62,6 +62,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_random.h"
+#include "esp_heap_caps.h"
 #include "ethernet_init.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/inet.h"
@@ -77,11 +78,13 @@
 #include "mqtt_client.h"
 #include "mdns.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"
 #include "mbedtls/base64.h"
 
 #if CONFIG_EXAMPLE_USE_INTERNAL_ETHERNET
 #define ETHERNET_HARDWARE_LABEL "RTL8201"
 #define ETHERNET_RECOVERY_HINT "check GPIO0 clock, GPIO12 PHY power, and RJ45 link"
+#define BUILD_BOARD_ID "t-eth-lite"
 /* Live T-ETH-Lite BACnet read/write testing used 23,468 bytes of the HTTP
    task's 24,576-byte stack. Its PSRAM profile reserves internal memory for
    task stacks, so use that headroom rather than accepting a 1,108-byte margin. */
@@ -89,6 +92,7 @@
 #else
 #define ETHERNET_HARDWARE_LABEL "W5500"
 #define ETHERNET_RECOVERY_HINT "check W5500 wiring and SPI"
+#define BUILD_BOARD_ID "w5500"
 #define CONNECTED_HTTP_STACK_SIZE 24576
 #endif
 
@@ -2280,10 +2284,31 @@ static esp_err_t api_network_get_handler(httpd_req_t *req)
 static const httpd_uri_t api_network_uri = {
     .uri = "/api/network", .method = HTTP_GET, .handler = api_network_get_handler};
 
+static esp_err_t api_version_get_handler(httpd_req_t *req)
+{
+    const esp_app_desc_t *app = esp_app_get_description();
+    char buf[160];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"version\":\"%s\",\"project\":\"%s\",\"board\":\"%s\"}",
+        app->version, app->project_name, BUILD_BOARD_ID);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, len);
+    return ESP_OK;
+}
+static const httpd_uri_t api_version_uri = {
+    .uri = "/api/version", .method = HTTP_GET, .handler = api_version_get_handler};
+
 static esp_err_t api_status_get_handler(httpd_req_t *req)
 {
     int64_t __req_start_us = esp_timer_get_time();
     diag_log("http GET /api/status start");
+    if (!EthConnected) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req,
+            "{\"bacnet_available\":false,\"bacnet_reason\":\"Ethernet link down\",\"rooms\":[]}",
+            HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
     bool sys_power = false;
     bool sys_power_valid = BacnetReady && read_bool_property(
         OBJECT_BINARY_VALUE, SYS_POWER_READBACK_INSTANCE, PROP_PRESENT_VALUE, &sys_power);
@@ -2348,6 +2373,15 @@ static esp_err_t api_health_get_handler(httpd_req_t *req)
 {
     int64_t __req_start_us = esp_timer_get_time();
     diag_log("http GET /api/health start");
+    /* BacnetReady says the datalink was initialised, not that the cable is
+       presently connected. Avoid six-second read timeouts per property. */
+    if (!EthConnected) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req,
+            "{\"bacnet_available\":false,\"bacnet_reason\":\"Ethernet link down\"}",
+            HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
     /* Cooling metrics */
     float cooling_output = 0.0f, required_cooling_output = 0.0f;
     bool cooling_output_valid = BacnetReady && read_real_property(
@@ -3511,6 +3545,24 @@ static uint32_t ScanTotal = 0;
 static uint8_t ScanPercent = 0;
 static char ScanErrorMsg[64] = {0};
 static TaskHandle_t ScanTaskHandle = NULL;
+static volatile bool ScanTaskFinished = false;
+static StaticTask_t ScanTaskTcb;
+static StackType_t *ScanTaskStack = NULL;
+
+/* The commissioning scan is optional and transient. Keep its sizeable stack
+   in PSRAM so Wi-Fi, lwIP, HTTP and BACnet retain internal DRAM. */
+static void scan_task_cleanup(void)
+{
+    if (ScanTaskHandle != NULL) {
+        vTaskDelete(ScanTaskHandle);
+        ScanTaskHandle = NULL;
+    }
+    if (ScanTaskStack != NULL) {
+        heap_caps_free(ScanTaskStack);
+        ScanTaskStack = NULL;
+    }
+    ScanTaskFinished = false;
+}
 
 static bool scan_catalog_acquire(void)
 {
@@ -3519,7 +3571,8 @@ static bool scan_catalog_acquire(void)
         return true;
     }
     for (size_t p = 0; p < SCAN_PAGE_COUNT; p++) {
-        ScanPages[p] = calloc(SCAN_PAGE_OBJECTS, sizeof(scanned_object_t));
+        ScanPages[p] = heap_caps_calloc(
+            SCAN_PAGE_OBJECTS, sizeof(scanned_object_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!ScanPages[p]) {
             for (size_t q = 0; q < p; q++) { free(ScanPages[q]); ScanPages[q] = NULL; }
             ScannedObjectCount = 0;
@@ -3533,6 +3586,11 @@ static bool scan_catalog_acquire(void)
    while a scan is in progress. */
 static void scan_catalog_release_if_idle(void)
 {
+    /* mqtt_state_task calls this every 45 seconds. Reap a completed static
+       worker promptly even if the operator never starts another scan. */
+    if (ScanTaskFinished) {
+        scan_task_cleanup();
+    }
     if (!scan_catalog_present() || ScanState == SCAN_STATE_RUNNING) {
         return;
     }
@@ -3561,12 +3619,12 @@ static void object_scan_task(void *arg)
     ScanTotal = 0;
     ScanErrorMsg[0] = '\0';
 
-    if (!BacnetReady) {
+    if (!BacnetReady || !EthConnected) {
         ScanState = SCAN_STATE_ERROR;
-        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "BACnet datalink not ready");
-        ScanTaskHandle = NULL;
+        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "BACnet unavailable (check Ethernet link)");
+        ScanTaskFinished = true;
         task_registry_remove_self();
-    vTaskDelete(NULL);
+        vTaskSuspend(NULL);
         return;
     }
 
@@ -3640,9 +3698,11 @@ static void object_scan_task(void *arg)
     }
 
     ScanState = SCAN_STATE_COMPLETE;
-    ScanTaskHandle = NULL;
+    ScanTaskFinished = true;
     task_registry_remove_self();
-    vTaskDelete(NULL);
+    /* The next scan request reaps this suspended static task and frees the
+       PSRAM stack. A task must not free the stack it is currently using. */
+    vTaskSuspend(NULL);
 }
 
 static esp_err_t api_objects_scan_start_handler(httpd_req_t *req)
@@ -3651,6 +3711,16 @@ static esp_err_t api_objects_scan_start_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"ok\":true,\"status\":\"already_running\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
+    }
+    if (!EthConnected) {
+        ScanState = SCAN_STATE_ERROR;
+        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "Ethernet link down");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Ethernet link down\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (ScanTaskFinished) {
+        scan_task_cleanup();
     }
     if (!scan_catalog_acquire()) {
         /* 34.5KB contiguous is a big ask on this board. Fail the one endpoint
@@ -3676,17 +3746,30 @@ static esp_err_t api_objects_scan_start_handler(httpd_req_t *req)
        followed by an IntegerDivideByZero panic on the corrupted stack. The
        task is transient - created per scan, deleted at the end - so this is
        borrowed for the duration of a scan, not held. */
-    if (!spawn_task(object_scan_task, "obj_scan", 24576, NULL, 5, &ScanTaskHandle)) {
-        /* Unchecked before: a failed create left ScanState at RUNNING and the
-           scan hung at state=scanning forever with no error surfaced. */
+    ScanTaskStack = heap_caps_malloc(24576, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ScanTaskStack) {
         ScanState = SCAN_STATE_ERROR;
-        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "no memory for scan task");
-        diag_log("obj_scan task create failed - scan aborted");
+        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "no PSRAM for scan task");
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"ok\":false,\"error\":\"insufficient memory to start the scan\"}",
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"insufficient PSRAM to start the scan\"}",
                         HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
+    ScanTaskHandle = xTaskCreateStaticPinnedToCore(
+        object_scan_task, "obj_scan", 24576, NULL, 5, ScanTaskStack, &ScanTaskTcb, tskNO_AFFINITY);
+    if (!ScanTaskHandle) {
+        ScanState = SCAN_STATE_ERROR;
+        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "could not create scan task");
+        heap_caps_free(ScanTaskStack);
+        ScanTaskStack = NULL;
+        for (size_t p = 0; p < SCAN_PAGE_COUNT; p++) { heap_caps_free(ScanPages[p]); ScanPages[p] = NULL; }
+        ScannedObjectCount = 0;
+        diag_log("obj_scan static task create failed - scan aborted");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"could not start scan task\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    task_registry_add("obj_scan", ScanTaskHandle, 24576);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true,\"status\":\"started\"}", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -5625,6 +5708,7 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &wizard_page_uri);
         httpd_register_uri_handler(server, &mqtt_page_uri);
         httpd_register_uri_handler(server, &api_network_uri);
+        httpd_register_uri_handler(server, &api_version_uri);
         httpd_register_uri_handler(server, &api_status_uri);
         httpd_register_uri_handler(server, &api_health_uri);
         httpd_register_uri_handler(server, &api_room_setpoint_uri);

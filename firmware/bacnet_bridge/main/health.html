@@ -285,6 +285,11 @@
       function load() {
         document.getElementById('staleNote').textContent = 'Loading…';
         fetch('/api/health').then(function(r) { return r.json(); }).then(function(s) {
+          if (!s.bacnet_available && s.bacnet_reason) {
+            document.getElementById('staleNote').textContent =
+              'BACnet unavailable: ' + s.bacnet_reason + '. Reconnect Ethernet, then Refresh.';
+            return;
+          }
           var mode = s.active_mode || 'cooling';
           var isHeating = (mode === 'heating');
           var badge = document.getElementById('modeBadge');

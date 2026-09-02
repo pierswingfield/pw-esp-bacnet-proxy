@@ -1040,7 +1040,15 @@
 
       document.getElementById('scanBtn').onclick = function () {
         if (!confirm('Run a full BACnet discovery sweep across the controller? This can take up to a minute.')) return;
-        fetch('/api/objects/scan-start', { method: 'POST' }).then(function () { checkScanStatus(); });
+        fetch('/api/objects/scan-start', { method: 'POST' }).then(function (r) { return r.json(); }).then(function (s) {
+          if (!s.ok) {
+            document.getElementById('scanStatusText').textContent = 'Scan unavailable: ' + (s.error || 'check Ethernet link');
+            return;
+          }
+          checkScanStatus();
+        }).catch(function () {
+          document.getElementById('scanStatusText').textContent = 'Scan request failed.';
+        });
       };
       document.getElementById('refreshValuesBtn').onclick = function () { refreshActiveSectionValues(); };
       document.getElementById('manualAddBtn').onclick = function () {
