@@ -2,8 +2,8 @@
   "board": "t-eth-lite",
   "version": "0.3.0",
   "published_at": "2026-09-02",
-  "image_url": "",
-  "sha256": "",
+  "image_url": "https://github.com/pierswingfield/pw-esp-bacnet-proxy/releases/download/v0.3.0-t-eth-lite/bacnet_bridge.bin",
+  "sha256": "a5b2e7cb99c81c519b0915497f34aa57a2164998758f4df41997383604791a1c",
   "changelog": [
     "T-ETH-Lite is the primary hardware profile.",
     "Health and status pages report an unplugged BACnet Ethernet link immediately.",
