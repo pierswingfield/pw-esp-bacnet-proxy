@@ -173,10 +173,11 @@ git push origin vX.Y.Z-t-eth-lite
 ```
 
 The `Publish T-ETH-Lite OTA release` GitHub workflow builds the T-ETH-Lite
-profile in ESP-IDF 5.3.1, rejects a tag/version mismatch, uploads the OTA
-binary to the GitHub release, calculates its SHA-256, and commits the live
-manifest back to `master`. The browser then exposes its changelog and download
-only to compatible, older T-ETH-Lite firmware.
+profile and regression-builds the legacy W5500 profile in ESP-IDF 5.3.1. It
+then rejects a tag/version mismatch, uploads the OTA binary to the GitHub
+release, calculates its SHA-256, and commits the live manifest back to
+`master`. The browser then exposes its changelog and download only to
+compatible, older T-ETH-Lite firmware.
 
 ### 2. Physical Installation
 1. Mount the selected Ethernet hardware inside or near the FCU controller enclosure.

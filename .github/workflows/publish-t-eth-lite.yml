@@ -20,7 +20,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build the primary T-ETH-Lite OTA image
+      - name: Build the primary image and validate the legacy profile
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -32,6 +32,11 @@ jobs:
             espressif/idf:v5.3.1 \
             idf.py -B build-release -DSDKCONFIG=build-release/sdkconfig \
               -DSDKCONFIG_DEFAULTS='sdkconfig.defaults;sdkconfig.t_eth_lite.defaults' build
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" -w /work/firmware/bacnet_bridge \
+            espressif/idf:v5.3.1 \
+            idf.py -B build-w5500-release -DSDKCONFIG=build-w5500-release/sdkconfig \
+              -DSDKCONFIG_DEFAULTS='sdkconfig.defaults;sdkconfig.w5500.defaults' build
           BUILT_VERSION=$(jq -r '.project_version' firmware/bacnet_bridge/build-release/project_description.json)
           test "$BUILT_VERSION" = "$VERSION" || {
             echo "Tag version $VERSION does not match firmware version $BUILT_VERSION" >&2
