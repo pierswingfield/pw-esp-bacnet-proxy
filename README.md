@@ -18,14 +18,14 @@ To use this bridge in your home automation setup, you will need:
 
 ## Hardware & Wiring
 
-The installed baseline remains the ESP32-WROOM plus W5500 arrangement below.
-The parallel T-ETH-Lite V2 profile uses the board's integrated RTL8201 Ethernet
-PHY and 8 MiB PSRAM; it achieved live Wi-Fi, MQTT and BACnet parity against
-the Delta `C305` controller on 2 September 2026. Its board-specific wiring,
-build profile and evidence record are in
+The installed baseline is now the **T-ETH-Lite** profile, using its integrated
+RTL8201 Ethernet PHY, 16 MB flash and PSRAM. T-ETH-Lite 0.3.0 passed live
+Wi-Fi/MQTT/BACnet operation, Ethernet recovery, object scanning and LAN OTA
+against the Delta `C305` controller on 2 September 2026. Its board-specific
+wiring, build profile and evidence record are in
 [`docs/T_ETH_LITE_V2_ARCHITECTURE_AND_BUILD.md`](docs/T_ETH_LITE_V2_ARCHITECTURE_AND_BUILD.md).
-The W5500 path remains the production baseline until the T-ETH soak and
-release gates are complete.
+The ESP32-WROOM plus W5500 arrangement below is retained as a legacy/recovery
+profile only.
 
 | Component | Specification | Notes |
 |---|---|---|
@@ -108,10 +108,10 @@ affected board, power supply, antenna placement, or cable is sound. See
 [`docs/LOGGING_TOOLS.md`](docs/LOGGING_TOOLS.md) before changing the hardware
 or diagnosing a new outage.
 
-### T-ETH-Lite V2 integration (2 September 2026)
+### T-ETH-Lite primary integration (2 September 2026)
 
-The current T-ETH candidate is a separate, integrated-PHY profile; it does
-not reuse the W5500 SPI wiring. A freshly generated configuration enabled
+T-ETH-Lite 0.3.0 is a separate, integrated-PHY profile; it does not reuse the
+W5500 SPI wiring. Its generated configuration enables
 PSRAM-backed ordinary allocations and Wi-Fi/LwIP allocation, while retaining
 a 32 KiB internal/DMA reserve. The application-only image was read-back
 verified after flashing. On the target it restored saved Wi-Fi and MQTT,

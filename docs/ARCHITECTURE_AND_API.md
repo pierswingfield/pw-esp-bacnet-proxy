@@ -44,9 +44,10 @@ The Delta DAC-1180E controller features **dual Ethernet ports** (daisy-chain por
 
 ### T-ETH-Lite V2 integrated-PHY profile
 
-The W5500 wiring above describes the production baseline. The T-ETH-Lite V2
-profile is a separate ESP32-WROVER-E target with an integrated RTL8201 RMII
-PHY, 16 MiB flash and 8 MiB PSRAM; it must not be wired as a W5500. Its
+The W5500 wiring above describes the legacy/recovery profile. The primary
+T-ETH-Lite profile is a separate ESP32-WROVER-E target with an integrated
+RTL8201 RMII PHY, 16 MiB flash and 8 MiB PSRAM; it must not be wired as a
+W5500. Its
 board-specific GPIO assignment, flash procedure, memory profile and live
 validation record are maintained in
 [`T_ETH_LITE_V2_ARCHITECTURE_AND_BUILD.md`](T_ETH_LITE_V2_ARCHITECTURE_AND_BUILD.md).
@@ -130,8 +131,12 @@ matching ELF as described in `LOGGING_TOOLS.md`.
    - Upstream `bip.c` stores UDP ports in `BACNET_ADDRESS.mac[4:6]` in native host byte order (little-endian on ESP32), while standard helper `bacnet_address_mac_from_ascii()` outputs big-endian.
    - Mixing the two sent requests to port `49338` instead of `47808`. Fixed in `main.c`'s `bind_target_device()`.
 4. **Browser Memory & Object Cataloging**:
-   - Fetching 430+ BACnet objects in a single JSON payload exceeded micro-controller RAM and caused web browser lockups.
-   - Resolution: Implemented chunked paginated scanning (`/api/scan/objects?offset=...`) and on-device catalog pinning (`/api/catalog/pin`).
+   - A full object catalog and 24 KiB scanner task could exhaust internal RAM
+     after Wi-Fi/MQTT startup.
+   - Resolution: the T-ETH-Lite scanner uses PSRAM for its paged temporary
+     catalog and task stack. It exposes `/api/objects/scan-start`,
+     `/api/objects/scan-status` and `/api/objects`; the workstation CLI saves
+     the resulting JSON catalog.
 5. **W5500 traffic and WiFi**:
    - On the tested installation, live BACnet reads over an energised W5500
      link can degrade the ESP32 WiFi uplink. The cause remains a physical
@@ -313,8 +318,8 @@ published changelog and release download when a newer compatible image exists.
 
 ---
 
-## Future Architecture Roadmap
+## Out of scope
 
-1. **Native Apple HomeKit Integration**: Embedded HAP (HomeKit Accessory Protocol) daemon running directly on the ESP32 to allow native pairing with Apple Home without needing Home Assistant or Homebridge.
-2. **Native Google Home Integration**: Local Matter / Google Home Local SDK support for direct voice and app control via Google Assistant ecosystem.
-3. **Native Amazon Alexa Integration**: Direct local Alexa Smart Home Skill API integration for direct voice control.
+Native HomeKit, Matter/Google Home and Alexa integrations are not committed
+roadmap items for this firmware. Home Assistant via MQTT remains the supported
+automation integration.

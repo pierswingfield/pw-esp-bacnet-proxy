@@ -1,7 +1,7 @@
 # T-ETH-Lite ESP32 V2: hardware build and firmware architecture
 
-Status: verified T-ETH-Lite candidate and primary-profile promotion record
-Target branch: `codex/t-eth-lite-hardware-proof`
+Status: T-ETH-Lite 0.3.0 verified release and primary-profile record
+Primary branch: `master`
 Target board: LILYGO T-ETH-Lite ESP32, ESP32-WROVER-E, RTL8201
 Explicitly not the ESP32-S2/S3 T-ETH-Lite variants
 
@@ -108,7 +108,7 @@ do not also connect a programmer's 5 V output.
 - Keep the WROVER antenna end clear of metal, mains wiring and cable bundles.
 - Route the Ethernet and power cables away from the PCB antenna rather than
   folding them across it.
-- Retain access to TXD, RXD, GND, BOOT and RESET until OTA is proven.
+- Retain access to TXD, RXD, GND, BOOT and RESET for recovery and diagnostics.
 
 The integrated PHY should remove much of the previous flying-wire/W5500
 integration risk. It does not prove that Wi-Fi RF performance is fixed; this
@@ -198,10 +198,10 @@ Strongly recommended for a beginner:
 A generic CP2102/CP2104/CH340 USB-UART adapter would be inexpensive and more
 convenient, but it is optional rather than a blocker.
 
-## 7. Firmware migration architecture
+## 7. Historical firmware migration architecture
 
-The production `master` branch remains the recovery line for the W5500 unit.
-The new hardware is developed on `codex/t-eth-lite-hardware-proof`.
+`master` is the T-ETH-Lite primary line. The W5500 unit is retained as an
+explicit legacy/recovery profile.
 
 ### Stage 0: hardware proof
 
@@ -252,7 +252,7 @@ Gate: full functional parity before structural changes.
 - Initially keep task stacks, EMAC DMA data and synchronization objects in
   internal DRAM. Stage 1 measurements showed that keeping every Wi-Fi/LwIP
   buffer internal as well did not leave enough contiguous memory for the
-  measured HTTP and MQTT task stacks, so the current T-ETH-only candidate also
+  measured HTTP and MQTT task stacks, so the current T-ETH-only profile also
   enables ESP-IDF's supported Wi-Fi/LwIP-in-PSRAM policy.
 - Retain allocation limits, task headroom and largest-free-block telemetry.
 
@@ -312,7 +312,7 @@ unicast discovery, room mapping, system/room power, setpoint readback, boost,
 object scanning, custom MQTT points, HA discovery/commands, all REST endpoints,
 configuration import/export, factory reset, OTA and diagnostics.
 
-### Stage 6: release acceptance
+### Stage 6: historical release matrix
 
 - 20 cold and 20 warm boots.
 - Ethernet and Wi-Fi disconnect/recovery tests.
@@ -453,7 +453,7 @@ to the Delta network. `/api/debug/stacks` reported 18,668 bytes of free internal
 heap, a 14,848-byte largest free block and a 3,964-byte minimum, even with
 Ethernet disconnected and no MQTT broker configured. The unconfigured MQTT
 startup path still reserves a 24,576-byte `mqtt_command` task stack and its
-queue. The corrective candidate defers those resources until a broker is saved
+queue. The corrective build defers those resources until a broker is saved
 and changes only the T-ETH-Lite profile to route ordinary allocations larger
 than 16 KiB to PSRAM. Task stacks, DMA allocations, Wi-Fi and LwIP buffers remain
 in internal RAM.
@@ -490,21 +490,10 @@ future measured workload again approaches stack exhaustion, use the planned
 single BACnet-worker queue rather than continuing to enlarge competing task
 stacks.
 
-### Backlog captured during Stage 1 setup
-
-- The post-Wi-Fi `Saved` response in `main.c` always tells the user to open
-  `http://esp-bacnet-bridge.local`, even when the provisioning-screen mDNS
-  toggle was left disabled. Generate this completion message from the saved
-  mDNS state: show the `.local` address only when advertising is enabled;
-  otherwise state that mDNS is disabled and tell the user to find the assigned
-  IP address in the router's connected-device/DHCP-client list. Retain the
-  router-IP fallback when mDNS is enabled but unsupported by the client.
-
 ## 10. Verified T-ETH-Lite integration state (2026-09-02)
 
-This is the operational record for the current candidate. Earlier stages
-remain the design and historical evidence; they are not instructions to
-rebuild or reflash this already-tested image.
+This is the operational record for the released primary profile. Earlier
+stages remain historical design evidence; they are not an active work plan.
 
 ### Current physical and live state
 
@@ -515,11 +504,13 @@ rebuild or reflash this already-tested image.
   `CONFIG_SPIRAM_USE_MALLOC=y`,
   `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` and
   `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768`.
-- The application image was `0x171d00` (1,514,752 bytes), SHA-256
-  `52c5c03e96d493addea9eadf9d8354f6bb0d66cb4fff2e2226d33cf57e947008`.
-  Only the application partition at `0x20000` was written; an independent
-  `esptool verify_flash` returned `verify OK (digest matched)`.
-- With the W5500 production bridge off the shared segment, the T-ETH-Lite
+- The published T-ETH-Lite 0.3.0 OTA application image is `0x173300`
+  (1,520,400 bytes), SHA-256
+  `a5b2e7cb99c81c519b0915497f34aa57a2164998758f4df41997383604791a1c`.
+  Its GitHub release asset was downloaded and checksum-verified after
+  publication. The earlier USB write to application partition `0x20000` also
+  passed independent `esptool verify_flash` digest verification.
+- With the legacy W5500 bridge off the shared segment, the T-ETH-Lite
   linked to the isolated Delta cable, discovered `C305` at `10.0.3.16`, and
   returned valid system, boost, room setpoint, temperature and power values.
 - `/api/debug/stacks` reported the requested 32,768-byte HTTP task, a
@@ -532,10 +523,8 @@ rebuild or reflash this already-tested image.
 
 ### Repository state and active soak
 
-- Branch: `codex/t-eth-lite-hardware-proof`. Principal changes are this
-  architecture record, the hardware proof project, the T-ETH defaults,
-  configurable PHY power, deferred MQTT resources and the T-ETH stack and
-  diagnostics work.
+- `master` is the primary T-ETH-Lite line. The W5500 implementation is a
+  legacy/recovery profile and is regression-built by the release workflow.
 - The 15-minute connected soak sampled `/api/status`, `/api/network`,
   `/api/mqtt/config` and `/api/debug/stacks` every 30 seconds. All 31 samples
   (124 API requests) succeeded: Ethernet and MQTT remained connected, uptime
@@ -547,32 +536,22 @@ rebuild or reflash this already-tested image.
   and W5500 profiles use the same static address. Do not erase NVS or whole
   flash during this validation.
 
-### Architecture decision gate
+### T-ETH-Lite 0.3.0 live acceptance
 
-If all required tasks start and mixed HTTP/MQTT/BACnet activity retains a
-comfortable measured margin, proceed to the soak matrix. Do not select a fixed
-margin from intuition: record high-water marks under the worst observed load,
-then apply the Stage 6 25-percent transient-allocation margin.
-
-If either network task still cannot start, or a task again approaches stack
-exhaustion, stop enlarging competing task stacks. Implement Stage 3's single
-long-lived BACnet worker with a bounded queue and fixed request/response
-objects. The application already allocates a static 24 KiB `BacnetTaskStack`
-for an initial probe that later self-deletes; reuse that ownership model so
-HTTP, MQTT and scans submit work rather than running BACnet transactions on
-their own stacks. Use bounded waits/task notifications or static semaphores,
-make queue pressure observable, and avoid heap allocation per request. Then
-resize HTTP/MQTT stacks from measured high-water marks.
+The published 0.3.0 release subsequently passed the operations that were
+previously tracked as pending: Ethernet unplug/replug recovery, immediate
+Health-page Ethernet-link warning, browser and CLI object scanning, and LAN
+OTA update. The OTA release is published from a version-matched
+`vX.Y.Z-t-eth-lite` tag by GitHub Actions; it builds the primary and legacy
+profiles, uploads the exact primary binary, and generates its manifest hash.
 
 ### Remaining release acceptance
 
-The original architectural migration is complete; the remaining work is live
-release acceptance rather than a planned rewrite. Before calling a firmware
-release production-ready, run the target-specific manual matrix: repeated cold
-and warm boot/recovery, full object scan under MQTT/dashboard load, a genuine
-LAN OTA update plus deliberate rollback test, and the 24-hour development /
-72-hour release-candidate soaks. A clean build is mechanical evidence only;
-record device telemetry, resets and largest-block margin from the live target.
+The original architectural migration is complete. The only remaining release
+acceptance evidence is a deliberately failing rollback test and the 24-hour
+development / 72-hour release-candidate soaks. A clean build is mechanical
+evidence only; record device telemetry, resets and largest-block margin from
+the live target.
 
 Do not erase the whole flash or NVS during the next test, power the target from
 both boards, connect both bridges to the Delta segment, or revert to the
