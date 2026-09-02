@@ -83,6 +83,14 @@ menu "Example Ethernet Configuration"
                 Set the GPIO number used to reset PHY chip.
                 Set to -1 to disable PHY chip hardware reset.
 
+        config EXAMPLE_ETH_PHY_POWER_GPIO
+            int "PHY power-enable GPIO number"
+            range -1 ENV_GPIO_OUT_RANGE_MAX
+            default -1
+            help
+                GPIO driven high before internal EMAC/PHY initialization.
+                Set to -1 when the board has no software-controlled PHY rail.
+
         config EXAMPLE_ETH_PHY_ADDR
             int "PHY Address"
             range -1 31

@@ -1,5 +1,6 @@
 # OS / IDE metadata
 .DS_Store
+__pycache__/
 .DS_Store?
 ._*
 .Spotlight-V100

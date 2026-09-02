@@ -8,6 +8,8 @@
 #include "esp_check.h"
 #include "esp_mac.h"
 #include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "sdkconfig.h"
 #if CONFIG_EXAMPLE_USE_SPI_ETHERNET
 #include "driver/spi_master.h"
@@ -61,7 +63,30 @@ static bool gpio_isr_svc_init_by_eth = false; // indicates that we initialized t
  */
 static esp_eth_handle_t eth_init_internal(esp_eth_mac_t **mac_out, esp_eth_phy_t **phy_out)
 {
-    esp_eth_handle_t ret = NULL;
+    esp_eth_mac_t *mac = NULL;
+    esp_eth_phy_t *phy = NULL;
+
+#if CONFIG_EXAMPLE_ETH_PHY_POWER_GPIO >= 0
+    gpio_config_t power_gpio = {
+        .pin_bit_mask = 1ULL << CONFIG_EXAMPLE_ETH_PHY_POWER_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t power_err = gpio_config(&power_gpio);
+    if (power_err != ESP_OK) {
+        ESP_LOGE(TAG, "PHY power GPIO config failed: %s", esp_err_to_name(power_err));
+        goto err;
+    }
+    power_err = gpio_set_level(CONFIG_EXAMPLE_ETH_PHY_POWER_GPIO, 1);
+    if (power_err != ESP_OK) {
+        ESP_LOGE(TAG, "PHY power enable failed: %s", esp_err_to_name(power_err));
+        goto err;
+    }
+    ESP_LOGI(TAG, "PHY power enabled on GPIO%d", CONFIG_EXAMPLE_ETH_PHY_POWER_GPIO);
+    vTaskDelay(pdMS_TO_TICKS(100));
+#endif
 
     // Init common MAC and PHY configs to default
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
@@ -81,24 +106,27 @@ static esp_eth_handle_t eth_init_internal(esp_eth_mac_t **mac_out, esp_eth_phy_t
     esp32_emac_config.dma_burst_len = ETH_DMA_BURST_LEN_4;
 #endif // CONFIG_EXAMPLE_USE_SPI_ETHERNET
     // Create new ESP32 Ethernet MAC instance
-    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&esp32_emac_config, &mac_config);
+    mac = esp_eth_mac_new_esp32(&esp32_emac_config, &mac_config);
     // Create new PHY instance based on board configuration
 #if CONFIG_EXAMPLE_ETH_PHY_IP101
-    esp_eth_phy_t *phy = esp_eth_phy_new_ip101(&phy_config);
+    phy = esp_eth_phy_new_ip101(&phy_config);
 #elif CONFIG_EXAMPLE_ETH_PHY_RTL8201
-    esp_eth_phy_t *phy = esp_eth_phy_new_rtl8201(&phy_config);
+    phy = esp_eth_phy_new_rtl8201(&phy_config);
 #elif CONFIG_EXAMPLE_ETH_PHY_LAN87XX
-    esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_config);
+    phy = esp_eth_phy_new_lan87xx(&phy_config);
 #elif CONFIG_EXAMPLE_ETH_PHY_DP83848
-    esp_eth_phy_t *phy = esp_eth_phy_new_dp83848(&phy_config);
+    phy = esp_eth_phy_new_dp83848(&phy_config);
 #elif CONFIG_EXAMPLE_ETH_PHY_KSZ80XX
-    esp_eth_phy_t *phy = esp_eth_phy_new_ksz80xx(&phy_config);
+    phy = esp_eth_phy_new_ksz80xx(&phy_config);
 #endif
     // Init Ethernet driver to default and install it
     esp_eth_handle_t eth_handle = NULL;
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
-    ESP_GOTO_ON_FALSE(esp_eth_driver_install(&config, &eth_handle) == ESP_OK, NULL,
-                        err, TAG, "Ethernet driver install failed");
+    esp_err_t install_err = esp_eth_driver_install(&config, &eth_handle);
+    if (install_err != ESP_OK) {
+        ESP_LOGE(TAG, "Ethernet driver install failed: %s", esp_err_to_name(install_err));
+        goto err;
+    }
 
     if (mac_out != NULL) {
         *mac_out = mac;
@@ -117,7 +145,7 @@ err:
     if (phy != NULL) {
         phy->del(phy);
     }
-    return ret;
+    return NULL;
 }
 #endif // CONFIG_EXAMPLE_USE_INTERNAL_ETHERNET
 

@@ -213,3 +213,18 @@ it stable: `/api/network` for link and reset reason, `/api/status` for usable
 BACnet values, and `/api/debug/stacks` for heap fragmentation and stack
 headroom. Keep the matching ELF for any installed image so a later core dump
 can be decoded. A successful flash by itself is not a stability result.
+
+These same endpoints are the primary non-invasive checks for both supported
+Ethernet profiles: the W5500 baseline and the T-ETH-Lite integrated RTL8201
+profile. For the T-ETH-Lite, record the requested 32 KiB HTTP stack and both
+MQTT task entries as well as free heap and largest block; do not compare only
+the total-free value across the two hardware profiles.
+
+For a read-only T-ETH smoke or soak check, use the repository helper. It
+fails on a lost link/MQTT connection, missing target or required task, failed
+request, or non-advancing uptime; it never writes BACnet state or firmware:
+
+```bash
+python3 tools/t_eth_runtime_check.py --samples 31 --interval 30 \
+  --output /tmp/t-eth-soak.jsonl
+```

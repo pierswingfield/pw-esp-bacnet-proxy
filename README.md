@@ -18,6 +18,15 @@ To use this bridge in your home automation setup, you will need:
 
 ## Hardware & Wiring
 
+The installed baseline remains the ESP32-WROOM plus W5500 arrangement below.
+The parallel T-ETH-Lite V2 profile uses the board's integrated RTL8201 Ethernet
+PHY and 8 MiB PSRAM; it achieved live Wi-Fi, MQTT and BACnet parity against
+the Delta `C305` controller on 2 September 2026. Its board-specific wiring,
+build profile and evidence record are in
+[`docs/T_ETH_LITE_V2_ARCHITECTURE_AND_BUILD.md`](docs/T_ETH_LITE_V2_ARCHITECTURE_AND_BUILD.md).
+The W5500 path remains the production baseline until the T-ETH soak and
+release gates are complete.
+
 | Component | Specification | Notes |
 |---|---|---|
 | **Microcontroller** | ESP32-WROOM-32D Development Board | **USB-C port** model recommended |
@@ -74,7 +83,7 @@ This project was built from deep on-wire discovery and protocol analysis of the 
 - **Rollback-Protected LAN OTA Updates**: Password-protected web OTA update with dual 1900KB app partitions and automatic bootloader rollback safety.
 - **Configuration Backup & Restore**: Export and import complete device configuration as a single JSON file.
 
-## Stability build (25 August 2026)
+## Stability builds
 
 The current stability build is designed to keep the bridge useful through WiFi
 and Ethernet faults on the installed, headless hardware:
@@ -99,6 +108,20 @@ affected board, power supply, antenna placement, or cable is sound. See
 [`docs/LOGGING_TOOLS.md`](docs/LOGGING_TOOLS.md) before changing the hardware
 or diagnosing a new outage.
 
+### T-ETH-Lite V2 integration (2 September 2026)
+
+The current T-ETH candidate is a separate, integrated-PHY profile; it does
+not reuse the W5500 SPI wiring. A freshly generated configuration enabled
+PSRAM-backed ordinary allocations and Wi-Fi/LwIP allocation, while retaining
+a 32 KiB internal/DMA reserve. The application-only image was read-back
+verified after flashing. On the target it restored saved Wi-Fi and MQTT,
+created the 32 KiB HTTP and both MQTT tasks with positive measured headroom,
+then linked to `C305` at `10.0.3.16` and returned live BACnet values.
+
+This is live integration evidence, not a declaration that the W5500 baseline
+has been retired. The active soak and remaining release matrix are recorded
+in the T-ETH-Lite architecture document.
+
 ---
 
 ## Planned Future Roadmap
@@ -112,7 +135,8 @@ or diagnosing a new outage.
 ## How to Use
 
 ### 1. Build & Flash
-Build using standard ESP-IDF v5.x:
+The default ESP-IDF v5.x build targets the T-ETH-Lite. Use a fresh build
+directory whenever switching hardware profiles:
 ```bash
 cd firmware/bacnet_bridge
 idf.py set-target esp32
@@ -120,10 +144,26 @@ idf.py build
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
+The W5500 implementation is retained as a legacy/recovery profile. Build it
+explicitly rather than relying on a default:
+
+```bash
+idf.py -B build-w5500 \
+  -DSDKCONFIG=build-w5500/sdkconfig \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.w5500.defaults" \
+  build
+```
+
+Validate both clean profile builds before a release (after sourcing ESP-IDF):
+
+```bash
+tools/validate_build_profiles.sh
+```
+
 ### 2. Physical Installation
-1. Mount the ESP32 board and W5500 module inside or near the FCU controller enclosure.
+1. Mount the selected Ethernet hardware inside or near the FCU controller enclosure.
 2. Connect power via USB-C.
-3. Plug an RJ45 Ethernet cable from the W5500 module into one of the RJ45 network ports on the Delta DAC-1180E controller.
+3. Plug its RJ45 Ethernet connection into one of the Delta DAC-1180E controller's network ports. Never connect the T-ETH-Lite and W5500 bridge to the isolated BACnet segment simultaneously when they share its static address.
 
 ### 3. First-Boot WiFi Setup
 1. When unconfigured, the device creates an open WiFi network: `ESP-BACnet-Setup`.

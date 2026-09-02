@@ -79,6 +79,19 @@
 #include "esp_ota_ops.h"
 #include "mbedtls/base64.h"
 
+#if CONFIG_EXAMPLE_USE_INTERNAL_ETHERNET
+#define ETHERNET_HARDWARE_LABEL "RTL8201"
+#define ETHERNET_RECOVERY_HINT "check GPIO0 clock, GPIO12 PHY power, and RJ45 link"
+/* Live T-ETH-Lite BACnet read/write testing used 23,468 bytes of the HTTP
+   task's 24,576-byte stack. Its PSRAM profile reserves internal memory for
+   task stacks, so use that headroom rather than accepting a 1,108-byte margin. */
+#define CONNECTED_HTTP_STACK_SIZE 32768
+#else
+#define ETHERNET_HARDWARE_LABEL "W5500"
+#define ETHERNET_RECOVERY_HINT "check W5500 wiring and SPI"
+#define CONNECTED_HTTP_STACK_SIZE 24576
+#endif
+
 #include "bacnet/bacdef.h"
 #include "bacnet/bacaddr.h"
 #include "bacnet/bacapp.h"
@@ -1476,14 +1489,14 @@ static void eth_bringup_task(void *arg)
     uint8_t eth_port_cnt = 0;
     esp_eth_handle_t *eth_handles;
 
-    /* Do NOT ESP_ERROR_CHECK this. A W5500 that fails its SPI chip-ID read used
+    /* Do NOT ESP_ERROR_CHECK this. An Ethernet controller that fails init must
        to abort() here, which boot-looped the entire bridge - WiFi, dashboard,
        MQTT and OTA all died because the Ethernet chip was unreachable. With the
        board in a wall enclosure that is unrecoverable without pulling it out.
-       Hit for real on 2026-08-24 after the module was physically disturbed:
+       This was hit on W5500 hardware on 2026-08-24 after physical disturbance:
        "emac_w5500_init(826): verify chip ID failed" -> ~65 panics in 40s.
        Ethernet is not required for the device to be reachable or updatable, so
-       a missing W5500 now degrades to WiFi-only instead of bricking the unit.
+       either board profile degrades to WiFi-only instead of bricking the unit.
        BACnet simply never starts, BacnetReady stays false, and /api/status
        reports its fields invalid - which is the correct visible symptom. */
     esp_err_t eth_err = ESP_FAIL;
@@ -1492,15 +1505,15 @@ static void eth_bringup_task(void *arg)
         if (eth_err == ESP_OK && eth_port_cnt > 0) {
             break;
         }
-        ESP_LOGE(TAG_BAC, "Ethernet/W5500 init failed (attempt %d/3): %s",
-                 attempt, esp_err_to_name(eth_err));
-        diag_log("eth init failed attempt %d/3 - check W5500 wiring/SPI", attempt);
+        ESP_LOGE(TAG_BAC, "Ethernet/%s init failed (attempt %d/3): %s",
+                 ETHERNET_HARDWARE_LABEL, attempt, esp_err_to_name(eth_err));
+        diag_log("eth init failed attempt %d/3 - %s", attempt, ETHERNET_RECOVERY_HINT);
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
     if (eth_err != ESP_OK || eth_port_cnt == 0) {
         ESP_LOGE(TAG_BAC,
-                 "Ethernet/W5500 unavailable - continuing WiFi-only, no BACnet. "
-                 "Check the W5500 wiring, then reboot.");
+                 "Ethernet/%s unavailable - continuing WiFi-only, no BACnet; %s.",
+                 ETHERNET_HARDWARE_LABEL, ETHERNET_RECOVERY_HINT);
         diag_log("eth unavailable - running WiFi-only, no BACnet");
         task_registry_remove_self();
     vTaskDelete(NULL);
@@ -3093,7 +3106,7 @@ static esp_err_t api_debug_stacks_get_handler(httpd_req_t *req)
     if (off < (int)sizeof(buf) - 96) {
         off += snprintf(buf + off, sizeof(buf) - off,
                         "%s{\"name\":\"httpd\",\"requested\":%u,\"headroom_bytes\":%u}",
-                        first ? "" : ",", (unsigned)24576,
+                        first ? "" : ",", (unsigned)CONNECTED_HTTP_STACK_SIZE,
                         (unsigned)uxTaskGetStackHighWaterMark(NULL));
     }
     off += snprintf(buf + off, sizeof(buf) - off, "]}");
@@ -3439,6 +3452,7 @@ static const httpd_uri_t api_setup_password_uri = {
 static void mqtt_publish_discovery(void);
 static void mqtt_unpublish_discovery(void);
 static void mqtt_app_restart(void);
+static void mqtt_app_start(void);
 
 /* ===================== Object Scanner & Browser APIs ===================== */
 
@@ -4779,7 +4793,7 @@ static esp_err_t api_mqtt_config_post_handler(httpd_req_t *req)
     }
 
     mqtt_config_save();
-    mqtt_app_restart();
+    mqtt_app_start();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -5217,7 +5231,7 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
         HaDiscoveryEnabled = mdisc;
     }
     mqtt_config_save();
-    mqtt_app_restart();
+    mqtt_app_start();
     wizard_completed_save();
 
     httpd_resp_set_type(req, "application/json");
@@ -5466,7 +5480,7 @@ static esp_err_t api_config_import_handler(httpd_req_t *req)
         HaHealthDiscoveryEnabled = mhdisc;
     }
     mqtt_config_save();
-    mqtt_app_restart();
+    mqtt_app_start();
     mqtt_publish_discovery();
 
     /* 6. Custom MQTT points */
@@ -5597,7 +5611,7 @@ static httpd_handle_t start_connected_webserver(void)
        sequentially needs comparable headroom. The `done` diag_log lines now
        report this task's stack high-water mark so the real margin is
        measurable instead of guessed - tune from that, not from intuition. */
-    config.stack_size = 24576;
+    config.stack_size = CONNECTED_HTTP_STACK_SIZE;
     config.max_uri_handlers = 55;
 
     ESP_LOGI(TAG_WIFI, "Starting connected-mode dashboard server on port: '%d'", config.server_port);
@@ -6399,9 +6413,27 @@ static void mqtt_app_restart(void)
 
 static void mqtt_app_start(void)
 {
+    /* A blank broker means MQTT is not configured. Do not permanently consume
+       a 24 KB internal-RAM task stack and queue for an inactive feature. The
+       configuration handlers call this function again when a broker is saved,
+       so MQTT still becomes live without a reboot. */
+    if (strlen(MqttBrokerHost) == 0) {
+        mqtt_app_restart();
+        ESP_LOGI(TAG_WIFI, "MQTT broker not configured - command resources deferred");
+        return;
+    }
+
     if (!MqttCommandQueue) {
         MqttCommandQueue = xQueueCreate(8, sizeof(mqtt_command_t));
-        spawn_task(mqtt_command_task, "mqtt_command", 24576, NULL, 5, NULL);
+        if (!MqttCommandQueue) {
+            ESP_LOGE(TAG_WIFI, "MQTT command queue allocation failed");
+            return;
+        }
+        if (!spawn_task(mqtt_command_task, "mqtt_command", 24576, NULL, 5, NULL)) {
+            vQueueDelete(MqttCommandQueue);
+            MqttCommandQueue = NULL;
+            return;
+        }
     }
     mqtt_app_restart();
 }

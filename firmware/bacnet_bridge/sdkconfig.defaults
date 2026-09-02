@@ -1,27 +1,7 @@
-# W5500 SPI Ethernet bring-up config — pins match requirements.md §3B exactly.
-CONFIG_EXAMPLE_USE_INTERNAL_ETHERNET=n
-CONFIG_EXAMPLE_USE_SPI_ETHERNET=y
-CONFIG_EXAMPLE_USE_W5500=y
-
-CONFIG_EXAMPLE_ETH_SPI_HOST=1
-CONFIG_EXAMPLE_ETH_SPI_SCLK_GPIO=18
-CONFIG_EXAMPLE_ETH_SPI_MOSI_GPIO=23
-CONFIG_EXAMPLE_ETH_SPI_MISO_GPIO=19
-CONFIG_EXAMPLE_ETH_SPI_CLOCK_MHZ=12
-CONFIG_EXAMPLE_ETH_SPI_CS0_GPIO=5
-CONFIG_EXAMPLE_ETH_SPI_INT0_GPIO=4
-CONFIG_EXAMPLE_ETH_SPI_PHY_RST0_GPIO=16
-
 # WiFi provisioning / captive portal config (dns_server + http server both
 # need more sockets than the default for the DNS redirect + form handling).
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_LWIP_MAX_SOCKETS=16
-
-# Real hardware is ESP-WROOM-32D N4xx (4MB flash, requirements.md S3) - this
-# was wrongly left at 2MB (copied from the eth_bringup/wifi_provisioning
-# milestones' default, never corrected once the two merged). Matters now:
-# the OTA partition table below needs the real 4MB to fit two update slots.
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # Two-OTA-slot table (partitions.csv) for LAN firmware updates - see
 # api_ota_post_handler in main.c. Replaces the single-app-large table used

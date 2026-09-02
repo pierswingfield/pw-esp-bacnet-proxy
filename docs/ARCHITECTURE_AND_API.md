@@ -42,6 +42,18 @@ The W5500 module communicates over ESP32 SPI Host 1 (VSPI):
 ### Ethernet Topology Note
 The Delta DAC-1180E controller features **dual Ethernet ports** (daisy-chain ports), allowing the W5500 patch cable to plug directly into an available port on the controller. Single-port controllers requiring an external Ethernet hub are untested in this setup.
 
+### T-ETH-Lite V2 integrated-PHY profile
+
+The W5500 wiring above describes the production baseline. The T-ETH-Lite V2
+profile is a separate ESP32-WROVER-E target with an integrated RTL8201 RMII
+PHY, 16 MiB flash and 8 MiB PSRAM; it must not be wired as a W5500. Its
+board-specific GPIO assignment, flash procedure, memory profile and live
+validation record are maintained in
+[`T_ETH_LITE_V2_ARCHITECTURE_AND_BUILD.md`](T_ETH_LITE_V2_ARCHITECTURE_AND_BUILD.md).
+Both boards use the isolated `10.0.3.x` BACnet segment, so they must never be
+connected to that segment at the same time when configured with the same
+static address.
+
 ---
 
 ## 3. Firmware Architecture & Components
@@ -70,7 +82,9 @@ The Delta DAC-1180E controller features **dual Ethernet ports** (daisy-chain por
 ### Key Modules
 - **`main.c`**: Core orchestrator, HTTP REST handlers, WiFi manager, NVS persistence, MQTT publisher, and HTML embedding.
 - **`components/bacnet_client`**: Custom ESP-IDF port of Steve Karg's `bacnet-stack`. Implements `bip_socket_esp_idf.c` using raw lwIP sockets over the W5500 netif interface.
-- **`components/ethernet_init`**: Driver initialization for the W5500 SPI interface.
+- **`components/ethernet_init`**: Driver initialization for either the W5500
+  SPI interface or the T-ETH-Lite integrated RTL8201 PHY, selected by the
+  build profile.
 - **`components/dns_server`**: Captive portal DNS redirect server for initial WiFi provisioning.
 
 ### Non-Volatile Storage (NVS) Schema
@@ -223,13 +237,14 @@ Sets the system boost mode.
 Configures the boost auto-revert timeout in minutes (0 = disabled).
 - **Payload**: `{"value": 60}`
 
-#### `POST /api/room/{idx}/setpoint`
+#### `POST /api/room-setpoint`
 Sets a room's target temperature setpoint in °C.
-- **Payload**: `{"value": 21.5}`
+- **Payload**: `{"room": 0, "value": 21.5}`
 
-#### `POST /api/room/{idx}/power`
+#### `POST /api/room-power`
 Turns a specific room zone on or off.
-- **Payload**: `{"value": "on"}` or `{"value": "off"}`
+- **Payload**: `{"room": 0, "value": "on"}` or
+  `{"room": 0, "value": "off"}`
 
 ---
 
