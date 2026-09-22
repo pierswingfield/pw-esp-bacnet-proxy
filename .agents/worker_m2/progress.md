@@ -1,0 +1,21 @@
+# Progress Log — Milestone M2 Worker
+
+- **2026-09-02T20:10:00Z**: Analyzed `ORIGINAL_REQUEST.md`, `PROJECT.md`, `explorer_survey_2/handoff.md`, `spec_miner_survey_3/handoff.md`.
+- **2026-09-02T20:12:00Z**: Created `firmware/bacnet_bridge/components/bacnet_client/bacnet_worker.h` with dual-priority queue definitions, circuit breaker states, request/response models, and typed sync/async helper prototypes.
+- **2026-09-02T20:13:00Z**: Implemented `firmware/bacnet_bridge/components/bacnet_client/bacnet_worker.c` containing dedicated `bacnet_worker_task` (24KB static stack), UDP socket ownership, TSM transaction pumping, 64-entry 30s TTL read cache with precise invalidation, target health circuit breaker, and dispatch functions.
+- **2026-09-02T20:13:30Z**: Updated `components/bacnet_client/CMakeLists.txt` and `components/hvac_core/CMakeLists.txt`.
+- **2026-09-02T20:14:00Z**: Updated `components/hvac_core/include/hvac_core.h` and implemented semantic domain operations in `components/hvac_core/hvac_core.c`.
+- **2026-09-02T20:14:45Z**: Received feedback from parent on enum name prefixing (`BACNET_WORKER_STATUS_*`) and datalink header cleanup (`bacnet/datalink/bip.h`). Prefixed all status enum values.
+- **2026-09-02T20:16:30Z**: Refactored `firmware/bacnet_bridge/main/main.c`:
+  - Removed un-serialized global BACnet transaction variables and handlers.
+  - Routed typed property reads/writes through `bacnet_worker_*`.
+  - Routed HVAC semantic operations through `hvac_core_*`.
+  - Routed object explorer and batch reads through `bacnet_worker_explorer_*_sync`.
+  - Routed Who-Is network discovery through `bacnet_worker_discover_sync`.
+  - Replaced `bacnet_client_task` with `bacnet_worker_start`.
+  - Reduced `mqtt_command_task` stack from 24576 to 4096 bytes.
+  - Reduced `mqtt_state_task` stack from 16384 to 4096 bytes.
+  - Removed obsolete `BacnetMutex`.
+- **2026-09-02T20:20:11Z**: Validated dual-profile builds (`./tools/validate_build_profiles.sh`) for both primary T-ETH-Lite and legacy W5500: PASSED (exit code 0).
+- **2026-09-02T20:20:26Z**: Ran full test suite (`pytest`): 125/125 PASSED in 9.01s.
+- **2026-09-02T20:21:00Z**: Verified `bacnet-object-catalog.json` remains untouched. Prepared final handoff report.

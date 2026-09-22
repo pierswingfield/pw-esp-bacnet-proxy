@@ -31,3 +31,12 @@ menu "WiFi Provisioning Configuration"
         help
             Max number of the STA connects to AP.
 endmenu
+
+menu "Matter Configuration"
+    config ENABLE_ESP_MATTER
+        bool "Enable ESP-Matter Integration"
+        default y if SPIRAM
+        default n
+        help
+            Enable Matter-over-Wi-Fi Thermostat integration for T-ETH-Lite profile.
+endmenu

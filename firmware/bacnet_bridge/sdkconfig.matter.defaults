@@ -1,0 +1,59 @@
+# Additive overlay for the real ESP-Matter T-ETH-Lite build variant.
+# Apply on top of sdkconfig.defaults;sdkconfig.t_eth_lite.defaults, and only
+# when ESP_MATTER_PATH is sourced (see CMakeLists.txt). Does not touch the
+# default T-ETH-Lite or W5500 profiles.
+
+# BLE for Matter commissioning
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# NimBLE + CHIP/Matter's static buffers do not fit in internal DRAM
+# alongside the rest of this project. Move .bss/noinit into PSRAM, and push
+# NimBLE's own host/controller buffers to external memory too.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# CHIP/Matter requires IPv6
+CONFIG_LWIP_IPV6=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+CONFIG_LWIP_HOOK_IP6_ROUTE_DEFAULT=y
+CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
+# Unique local addresses for fabrics (MAX_FABRIC) plus one link-local address
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=6
+
+CONFIG_MBEDTLS_HKDF_C=y
+
+# The CHIP stack's own task/event-loop needs more headroom than the
+# project's existing default main task stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Shrinks CHIP_CONFIG_MAX_FABRICS and a few IM pool sizes to fit this
+# board's internal DRAM; see main/chip_project_config.h for why.
+CONFIG_CHIP_PROJECT_CONFIG="main/chip_project_config.h"
+
+# The base T-ETH-Lite profile forces every allocation under 16KB internal
+# regardless of whether it's actually DMA/ISR-sensitive - fine with just
+# BACnet+HTTP+MQTT, but with BLE/CHIP added simultaneously it starves
+# internal heap to a measured 31 bytes free at runtime. Only small,
+# genuinely internal-only allocations (semaphores, DMA descriptors) need
+# to stay internal; most WiFi/BT/CHIP small objects can live in PSRAM.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+
+# esp_matter's own dynamic allocator (cluster/endpoint structs) defaults
+# to MALLOC_CAP_INTERNAL regardless of the general SPIRAM policy above -
+# this is what was actually failing ("Couldn't allocate EmberAfCluster")
+# even after internal heap was freed elsewhere. Route it to PSRAM instead.
+CONFIG_ESP_MATTER_MEM_ALLOC_MODE_EXTERNAL=y
+
+# SDK default is 15 minutes. The dashboard/BACnet path shares CPU/radio
+# with BLE while this window is open, so bound the worst case tighter.
+# Only affects the automatic commissioning window opened at boot for an
+# unpaired device - a paired device does not reopen it on a normal boot.
+CONFIG_CHIP_DISCOVERY_TIMEOUT_SECS=600
+
+# CHIP's LwIP core lock (a small FreeRTOS mutex, genuinely internal-only)
+# failed once during a contention spike: WiFi reconnect and CHIP stack
+# bring-up both drawing on the internal-only reserve pool at the same
+# instant. Give that reserve more headroom for exactly this kind of spike.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304

@@ -1,0 +1,33 @@
+# Forces esp_matter's and CHIP/connectedhomeip's static (.bss) data into
+# PSRAM. These are GN-built external libraries, not ESP-IDF components, so
+# they never get the extram_bss placement ESP-IDF's own big components
+# (wifi, lwip) receive automatically via their own linker fragments -
+# CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY alone only lifts the
+# restriction, it does not place anything without a mapping like this one.
+[mapping:matter_esp_matter_extram]
+archive: libesp_matter.a
+entries:
+    if SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
+
+[mapping:matter_chip_extram]
+archive: libCHIP.a
+entries:
+    if SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
+
+[mapping:matter_bt_extram]
+archive: libbt.a
+entries:
+    if SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
+
+# main.c's own static buffers (log ring buffer, MQTT custom-point table,
+# device-scan bookkeeping) are plain application data, not DMA descriptors -
+# safe to move. Only enabled on the Matter build variant since the base
+# T-ETH-Lite/W5500 profiles already fit without this.
+[mapping:matter_main_extram]
+archive: libmain.a
+entries:
+    if SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        main (extram_bss)

@@ -62,6 +62,12 @@
       .decision-title { font-weight:bold; color:#166534; display:flex; align-items:center; gap:0.4em; }
       .decision-desc { color:#334155; font-size:0.84em; margin-top:0.15em; line-height:1.4; }
       .helper-note { font-size:0.84em; color:#64748b; margin-top:0.5em; line-height:1.4; background:#eff6ff; border:1px solid #bfdbfe; border-radius:4px; padding:0.6em 0.8em; }
+      .module-cards { display:flex; gap:0.6em; margin-top:0.8em; }
+      .module-card { flex:1; border:2px solid #e2e8f0; border-radius:6px; padding:0.8em 0.9em; cursor:pointer; transition:border-color 0.15s ease, box-shadow 0.15s ease; background:#fff; }
+      .module-card:hover { border-color:#93c5fd; }
+      .module-card.selected { border-color:#06c; box-shadow:0 1px 3px rgba(37,99,235,0.15); }
+      .module-card strong { font-size:0.9em; color:#0f172a; display:block; }
+      .module-card p { font-size:0.78em; margin:0.35em 0 0 0; color:#64748b; line-height:1.35; }
     </style>
     <title>Setup Wizard - ESP32 BACnet Bridge</title>
   </head>
@@ -72,7 +78,7 @@
         <div class="step-item" data-step="2"><div class="step-bubble">2</div><div class="step-label">BACnet</div></div>
         <div class="step-item" data-step="3"><div class="step-bubble">3</div><div class="step-label">Analysis</div></div>
         <div class="step-item" data-step="4"><div class="step-bubble">4</div><div class="step-label">Rooms</div></div>
-        <div class="step-item" data-step="5"><div class="step-bubble">5</div><div class="step-label">MQTT</div></div>
+        <div class="step-item" data-step="5"><div class="step-bubble">5</div><div class="step-label">Automation</div></div>
         <div class="step-item" data-step="6"><div class="step-bubble">6</div><div class="step-label">Launch</div></div>
       </div>
 
@@ -239,46 +245,80 @@
         </div>
       </div>
 
-      <!-- Step 5: MQTT & Home Assistant -->
+      <!-- Step 5: Automation Integration -->
       <div id="step5" class="wizard-step" style="display:none;">
-        <h1>Step 5: Home Assistant &amp; MQTT</h1>
-        <p>Configure MQTT settings so Home Assistant can discover and control your climate entities.</p>
+        <h1>Step 5: Choose Automation</h1>
+        <p>Pick how this bridge connects to your home automation. Only one can be active at a time; the dashboard itself stays available regardless of what you choose here.</p>
 
-        <div style="display:flex; justify-content:space-between; align-items:baseline;">
-          <label for="mqHost" style="margin-top:0.8em;">MQTT Broker IP / Hostname</label>
-          <button type="button" id="btnScanMqtt" class="small" style="margin-top:0;">Scan for Brokers</button>
-        </div>
-        <input type="text" id="mqHost" placeholder="e.g. 192.168.1.50 or homeassistant.local">
-        <ul class="net-list" id="mqBrokerList" style="display:none; margin-top:0.4em;"></ul>
-        <div id="mqScanStatus" style="font-size:0.82em; color:#64748b; margin-top:0.3em;"></div>
-
-        <div style="display:flex; gap:0.5em;">
-          <div style="flex:1;">
-            <label for="mqPort">Port</label>
-            <input type="number" id="mqPort" value="1883">
+        <div class="module-cards">
+          <div class="module-card" data-mode="none" onclick="selectIntegrationMode('none')">
+            <strong>Dashboard Only</strong>
+            <p>Use the web dashboard directly. No external automation is started.</p>
           </div>
-          <div style="flex:2;">
-            <label for="mqBaseTopic">Base Topic Prefix</label>
-            <input type="text" id="mqBaseTopic" placeholder="e.g. esp32bacnet">
+          <div class="module-card" data-mode="mqtt_home_assistant" onclick="selectIntegrationMode('mqtt_home_assistant')">
+            <strong>MQTT / Home&nbsp;Assistant</strong>
+            <p>Connect to an existing MQTT broker with Home Assistant discovery.</p>
+          </div>
+          <div class="module-card" data-mode="matter" onclick="selectIntegrationMode('matter')">
+            <strong>Matter</strong>
+            <p>Pair directly with Apple Home, Google Home, or Alexa over BLE + WiFi.</p>
           </div>
         </div>
 
-        <label for="mqUser">Username (optional)</label>
-        <input type="text" id="mqUser" placeholder="Leave empty for anonymous auth">
+        <!-- MQTT / Home Assistant module panel -->
+        <div id="mqttModulePanel" style="display:none;">
+          <div style="display:flex; justify-content:space-between; align-items:baseline;">
+            <label for="mqHost" style="margin-top:0.8em;">MQTT Broker IP / Hostname</label>
+            <button type="button" id="btnScanMqtt" class="small" style="margin-top:0;">Scan for Brokers</button>
+          </div>
+          <input type="text" id="mqHost" placeholder="e.g. 192.168.1.50 or homeassistant.local">
+          <ul class="net-list" id="mqBrokerList" style="display:none; margin-top:0.4em;"></ul>
+          <div id="mqScanStatus" style="font-size:0.82em; color:#64748b; margin-top:0.3em;"></div>
 
-        <label for="mqPass">Password (optional)</label>
-        <input type="password" id="mqPass" placeholder="Leave empty for anonymous auth">
+          <div style="display:flex; gap:0.5em;">
+            <div style="flex:1;">
+              <label for="mqPort">Port</label>
+              <input type="number" id="mqPort" value="1883">
+            </div>
+            <div style="flex:2;">
+              <label for="mqBaseTopic">Base Topic Prefix</label>
+              <input type="text" id="mqBaseTopic" placeholder="e.g. esp32bacnet">
+            </div>
+          </div>
 
-        <div style="margin-top:1em;">
-          <label style="display:flex; align-items:center; gap:0.4em; cursor:pointer;">
-            <input type="checkbox" id="haDiscEn" checked style="width:auto; margin:0;">
-            Enable Home Assistant MQTT Discovery
-          </label>
+          <label for="mqUser">Username (optional)</label>
+          <input type="text" id="mqUser" placeholder="Leave empty for anonymous auth">
+
+          <label for="mqPass">Password (optional)</label>
+          <input type="password" id="mqPass" placeholder="Leave empty for anonymous auth">
+
+          <div style="margin-top:1em;">
+            <label style="display:flex; align-items:center; gap:0.4em; cursor:pointer;">
+              <input type="checkbox" id="haDiscEn" checked style="width:auto; margin:0;">
+              Enable Home Assistant MQTT Discovery
+            </label>
+          </div>
+
+          <div style="margin-top:0.8em;">
+            <button type="button" id="btnTestMqtt" class="small">Test Broker Connection</button>
+            <span id="mqTestResult" style="font-size:0.85em; margin-left:0.5em;"></span>
+          </div>
         </div>
 
-        <div style="margin-top:0.8em;">
-          <button type="button" id="btnTestMqtt" class="small">Test Broker Connection</button>
-          <span id="mqTestResult" style="font-size:0.85em; margin-left:0.5em;"></span>
+        <!-- Matter module panel -->
+        <div id="matterModulePanel" class="card" style="display:none; border-left:4px solid #06c;">
+          <h3 style="margin-top:0;">Matter Pairing</h3>
+          <p style="margin:0;">
+            After Save &amp; Launch, the bridge restarts and opens a 10-minute BLE pairing window.
+            Open your phone's Apple Home, Google Home, or Alexa app and add a new Matter device
+            while that window is open. The dashboard may be briefly slower to respond during
+            active pairing (BLE and WiFi share this device's single radio) - that clears on its
+            own once pairing completes or the window times out.
+          </p>
+          <p style="margin:0.8em 0 0 0;">
+            Check pairing status any time from the <a href="/health" target="_blank">Health page</a>,
+            which also offers a retry button if the window closes before you finish pairing.
+          </p>
         </div>
 
         <div class="btn-row">
@@ -296,8 +336,9 @@
           <div class="row"><span class="label">BACnet Controller</span><span class="value ok" id="revBacTarget">-</span></div>
           <div class="row"><span class="label">Configured Fan Count</span><span class="value" id="revFans">-</span></div>
           <div class="row"><span class="label">Active Rooms</span><span class="value" id="revRooms">-</span></div>
-          <div class="row"><span class="label">MQTT Broker</span><span class="value" id="revMqtt">-</span></div>
-          <div class="row"><span class="label">HA Discovery</span><span class="value ok" id="revHaDisc">Enabled</span></div>
+          <div class="row"><span class="label">Automation</span><span class="value ok" id="revIntegration">-</span></div>
+          <div class="row" id="revMqttRow"><span class="label">MQTT Broker</span><span class="value" id="revMqtt">-</span></div>
+          <div class="row" id="revHaDiscRow"><span class="label">HA Discovery</span><span class="value ok" id="revHaDisc">Enabled</span></div>
         </div>
 
         <p class="note" style="margin-top:1em;">Clicking <strong>Save &amp; Launch</strong> will store settings in non-volatile flash memory, bind the room points, connect to your MQTT broker, and publish Home Assistant discovery entities.</p>
@@ -326,6 +367,7 @@
       };
       var detectedRooms = [];
       var detectedFanCount = 0;
+      var selectedIntegrationMode = 'mqtt_home_assistant';
 
       function gotoStep(step) {
         currentStep = step;
@@ -347,6 +389,33 @@
         if (step === 4) {
           loadAnalysis().then(function() { renderRoomEditor(); });
         }
+        if (step === 5) loadIntegrationMode();
+      }
+
+      // Step 5: Automation module selector
+      function selectIntegrationMode(mode) {
+        selectedIntegrationMode = mode;
+        document.querySelectorAll('.module-card').forEach(function(c) {
+          c.classList.toggle('selected', c.getAttribute('data-mode') === mode);
+        });
+        document.getElementById('mqttModulePanel').style.display = (mode === 'mqtt_home_assistant') ? 'block' : 'none';
+        document.getElementById('matterModulePanel').style.display = (mode === 'matter') ? 'block' : 'none';
+      }
+
+      function loadIntegrationMode() {
+        fetch('/api/integration').then(function(r) { return r.json(); }).then(function(res) {
+          if (!res || !res.ok) return;
+          var matterCard = document.querySelector('.module-card[data-mode="matter"]');
+          if (matterCard && !res.matter_supported) {
+            matterCard.style.opacity = '0.45';
+            matterCard.style.cursor = 'not-allowed';
+            matterCard.onclick = null;
+            matterCard.querySelector('p').textContent = 'Not available on this build.';
+          }
+          selectIntegrationMode(res.mode_name || 'mqtt_home_assistant');
+        }).catch(function() {
+          selectIntegrationMode(selectedIntegrationMode);
+        });
       }
 
       // Step 1: Admin Password
@@ -785,9 +854,18 @@
           }
         });
         document.getElementById('revRooms').textContent = activeRooms.length + ' Rooms (' + activeRooms.join(', ') + ')';
-        var host = document.getElementById('mqHost').value.trim() || 'Not configured';
-        document.getElementById('revMqtt').textContent = host + (host !== 'Not configured' ? (':' + document.getElementById('mqPort').value) : '');
-        document.getElementById('revHaDisc').textContent = document.getElementById('haDiscEn').checked ? 'Enabled' : 'Disabled';
+        var modeLabels = { none: 'Dashboard Only', mqtt_home_assistant: 'MQTT / Home Assistant', matter: 'Matter' };
+        document.getElementById('revIntegration').textContent = modeLabels[selectedIntegrationMode] || selectedIntegrationMode;
+        if (selectedIntegrationMode === 'mqtt_home_assistant') {
+          var host = document.getElementById('mqHost').value.trim() || 'Not configured';
+          document.getElementById('revMqtt').textContent = host + (host !== 'Not configured' ? (':' + document.getElementById('mqPort').value) : '');
+          document.getElementById('revMqttRow').style.display = 'flex';
+          document.getElementById('revHaDisc').textContent = document.getElementById('haDiscEn').checked ? 'Enabled' : 'Disabled';
+          document.getElementById('revHaDiscRow').style.display = 'flex';
+        } else {
+          document.getElementById('revMqttRow').style.display = 'none';
+          document.getElementById('revHaDiscRow').style.display = 'none';
+        }
       }
 
       function finishWizard() {
@@ -819,6 +897,7 @@
           target_device_id: discoveredDev.instance || 0,
           fan_count: detectedFanCount || 1,
           rooms: roomsPayload,
+          integration_mode: selectedIntegrationMode,
           mqtt_host: document.getElementById('mqHost').value.trim(),
           mqtt_port: parseInt(document.getElementById('mqPort').value, 10) || 1883,
           mqtt_user: document.getElementById('mqUser').value.trim(),

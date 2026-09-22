@@ -1,0 +1,2562 @@
+{
+  "count": 426,
+  "objects": [
+    {
+      "instance": 1,
+      "name": "Fan 1 Supply Air Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 2,
+      "name": "Fan 2 Supply Air Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 3,
+      "name": "Fan 3 Supply Air Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 4,
+      "name": "Fan 4 Supply Air Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 5,
+      "name": "Fan 5 Supply Air TS / Element Cutout",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 7,
+      "name": "Heating Valve Flow Meter",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 8,
+      "name": "Cooling Valve Flow Meter",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 9,
+      "name": "Return Air Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 101,
+      "name": "Room_A DNS24 Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 201,
+      "name": "Room_B DNS24 Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 301,
+      "name": "Room_C DNS24 Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 401,
+      "name": "Room_D DNS24 Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 501,
+      "name": "Room_E DNS24 Temperature Sensor",
+      "type": "analog-input",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Fan 1 Speed Signal / Fan Relay",
+      "type": "analog-output",
+      "writable": true
+    },
+    {
+      "instance": 2,
+      "name": "Fan 2 Speed Signal",
+      "type": "analog-output",
+      "writable": true
+    },
+    {
+      "instance": 3,
+      "name": "Fan 3 Speed Signal",
+      "type": "analog-output",
+      "writable": true
+    },
+    {
+      "instance": 4,
+      "name": "Fan 4 Speed Signal",
+      "type": "analog-output",
+      "writable": true
+    },
+    {
+      "instance": 5,
+      "name": "HIU Relay",
+      "type": "analog-output",
+      "writable": true
+    },
+    {
+      "instance": 6,
+      "name": "Status Light Signal",
+      "type": "analog-output",
+      "writable": true
+    },
+    {
+      "instance": 7,
+      "name": "Heating Valve / Element 1 Control Signal",
+      "type": "analog-output",
+      "writable": true
+    },
+    {
+      "instance": 8,
+      "name": "Cooling Valve Control Signal",
+      "type": "analog-output",
+      "writable": true
+    },
+    {
+      "instance": 3,
+      "name": "Heating Valve Achieved Flow",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 4,
+      "name": "Cooling Valve Achieved Flow",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 12,
+      "name": "Master Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 14,
+      "name": "Heating Element 1 Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 15,
+      "name": "analog-value #15",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 19,
+      "name": "Master Alarm Code",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 20,
+      "name": "FCU Design Heating Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 21,
+      "name": "Overall Current Heating Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 22,
+      "name": "Overall Required Heating Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 25,
+      "name": "FCU Design Cooling Duty (Sensible)",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 26,
+      "name": "Overall Current Cooling Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 27,
+      "name": "Overall Required Cooling Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 30,
+      "name": "Heating Valve Design Flow Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 32,
+      "name": "Heating Valve Current Flow Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 33,
+      "name": "Heating Valve Required Flow Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 34,
+      "name": "Heating Valve Trim",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 35,
+      "name": "Heating Valve Percentage of Design Flow",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 39,
+      "name": "Valve Drive Delay",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 40,
+      "name": "Cooling Valve Design Flow Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 42,
+      "name": "Cooling Valve Current Flow Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 43,
+      "name": "Cooling Valve Required Flow Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 44,
+      "name": "Cooling Valve Trim",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 45,
+      "name": "Cooling Valve Percentage of Design Flow",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 50,
+      "name": "Number of FCU Fans",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 51,
+      "name": "FCU Design Total Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 52,
+      "name": "FCU Current Total Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 53,
+      "name": "Fan 1 Trim",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 54,
+      "name": "Fan 2 Trim",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 55,
+      "name": "Fan 3 Trim",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 56,
+      "name": "Fan 4 Trim",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 57,
+      "name": "Minimum Allowed Airflow Per Fan",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 58,
+      "name": "Maximum Allowed Airflow Per Fan",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 59,
+      "name": "Fan Setback Factor",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 60,
+      "name": "Supply Air Control Temp",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 61,
+      "name": "Supply Air Control Limit",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 62,
+      "name": "Supply Air Low Limit",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 63,
+      "name": "Supply Air High Limit",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 64,
+      "name": "Heating Element High Limit",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 70,
+      "name": "Occupied Dead Band",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 71,
+      "name": "Unoccupied Dead Band",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 73,
+      "name": "Cooling Bias",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 74,
+      "name": "Heating Bias",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 75,
+      "name": "Flow Rate Minus Limit",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 76,
+      "name": "Flow Rate Plus Limit",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 80,
+      "name": "Data Exchange Timer",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 81,
+      "name": "Auto-Save Interval",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 82,
+      "name": "BACstat Timeout Period",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 83,
+      "name": "PIR Activation Delay",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 84,
+      "name": "PIR Inactivation Delay",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 85,
+      "name": "PIR Unoccupied Shutdown Delay",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 90,
+      "name": "Setpoint Adjustment Range",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 91,
+      "name": "Low Fabric Protection Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 92,
+      "name": "High Fabric Protection Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 93,
+      "name": "Filter Alarm Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 96,
+      "name": "Status Light Output Voltage",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 97,
+      "name": "Fan 5 Trim",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 99,
+      "name": "Controller MAC Address",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 100,
+      "name": "EZNS Backlight Duration",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 127,
+      "name": "Room_A eZNS BLight OFF Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 128,
+      "name": "Room_A eZNS BLight ON Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 129,
+      "name": "Room_A eZNS BLight Color",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 130,
+      "name": "Room_A eZNS BLight Status",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 227,
+      "name": "Room_B eZNS BLight OFF Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 228,
+      "name": "Room_B eZNS BLight ON Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 229,
+      "name": "Room_B eZNS BLight Color",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 230,
+      "name": "Room_B eZNS BLight Status",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 327,
+      "name": "Room_C eZNS BLight OFF Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 328,
+      "name": "Room_C eZNS BLight ON Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 329,
+      "name": "Room_C eZNS BLight Color",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 330,
+      "name": "Room_C eZNS BLight Status",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 427,
+      "name": "Room_D eZNS BLight OFF Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 428,
+      "name": "Room_D eZNS BLight ON Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 429,
+      "name": "Room_D eZNS BLight Color",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 430,
+      "name": "Room_D eZNS BLight Status",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 527,
+      "name": "Room_E eZNS BLight OFF Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 528,
+      "name": "Room_E eZNS BLight ON Intensity",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 529,
+      "name": "Room_E eZNS BLight Color",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 530,
+      "name": "Room_E eZNS BLight Status",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1100,
+      "name": "Room_A Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1101,
+      "name": "Room_A Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1102,
+      "name": "Room_A Supply Air Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1103,
+      "name": "Room_A Design Heating Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1104,
+      "name": "Room_A Design Cooling Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1105,
+      "name": "Room_A Required Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1106,
+      "name": "Room_A Current Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1107,
+      "name": "Room_A Design Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1108,
+      "name": "Room_A Current Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1110,
+      "name": "Room_A PIR Counter",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1111,
+      "name": "Room_A Fan Config",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1112,
+      "name": "Room_A Cooling Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1113,
+      "name": "Room_A Heating Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1114,
+      "name": "Room_A Occupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1115,
+      "name": "Room_A Unoccupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1116,
+      "name": "Room_A Integral Control Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1200,
+      "name": "Room_B Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1201,
+      "name": "Room_B Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1202,
+      "name": "Room_B Supply Air Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1203,
+      "name": "Room_B Design Heating Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1204,
+      "name": "Room_B Design Cooling Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1205,
+      "name": "Room_B Required Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1206,
+      "name": "Room_B Current Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1207,
+      "name": "Room_B Design Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1208,
+      "name": "Room_B Current Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1210,
+      "name": "Room_B PIR Counter",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1211,
+      "name": "Room_B Fan Config",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1212,
+      "name": "Room_B Cooling Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1213,
+      "name": "Room_B Heating Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1214,
+      "name": "Room_B Occupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1215,
+      "name": "Room_B Unoccupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1216,
+      "name": "Room_B Integral Control Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1300,
+      "name": "Room_C Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1301,
+      "name": "Room_C Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1302,
+      "name": "Room_C Supply Air Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1303,
+      "name": "Room_C Design Heating Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1305,
+      "name": "Room_C Required Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1306,
+      "name": "Room_C Current Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1307,
+      "name": "Room_C Design Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1308,
+      "name": "Room_C Current Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1310,
+      "name": "Room_C PIR Counter",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1311,
+      "name": "Room_C Fan Config",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1312,
+      "name": "Room_C Cooling Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1313,
+      "name": "Room_C Heating Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1314,
+      "name": "Room_C Occupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1315,
+      "name": "Room_C Unoccupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1316,
+      "name": "Room_C Integral Control Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1400,
+      "name": "Room_D Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1401,
+      "name": "Room_D Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1402,
+      "name": "Room_D Supply Air Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1403,
+      "name": "Room_D Design Heating Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1404,
+      "name": "Room_D Design Cooling Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1405,
+      "name": "Room_D Required Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1406,
+      "name": "Room_D Current Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1407,
+      "name": "Room_D Design Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1408,
+      "name": "Room_D Current Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1410,
+      "name": "Room_D PIR Counter",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1411,
+      "name": "Room_D Fan Config",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1412,
+      "name": "Room_D Cooling Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1413,
+      "name": "Room_D Heating Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1414,
+      "name": "Room_D Occupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1415,
+      "name": "Room_D Unoccupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1416,
+      "name": "Room_D Integral Control Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1500,
+      "name": "Room_E Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1501,
+      "name": "Room_E Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1502,
+      "name": "Room_E Supply Air Temperature",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1503,
+      "name": "Room_E Design Heating Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1504,
+      "name": "Room_E Design Cooling Duty",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1505,
+      "name": "Room_E Required Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1506,
+      "name": "Room_E Current Thermal Output",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1507,
+      "name": "Room_E Design Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1508,
+      "name": "Room_E Current Air Volume",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1510,
+      "name": "Room_E PIR Counter",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1511,
+      "name": "Room_E Fan Config",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1512,
+      "name": "Room_E Cooling Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1513,
+      "name": "Room_E Heating Setpoint",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1514,
+      "name": "Room_E Occupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1515,
+      "name": "Room_E Unoccupied Deadband",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 1516,
+      "name": "Room_E Integral Control Rate",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10000,
+      "name": "Fan 1 Link",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10001,
+      "name": "Fan 2 Link",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10002,
+      "name": "Fan 3 Link",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10003,
+      "name": "Fan 4 Link",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10004,
+      "name": "Fan 5 Link",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10100,
+      "name": "Meter Reading ACTUAL electric",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10101,
+      "name": "Meter Reading electric month1",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10102,
+      "name": "Meter Reading electric month2",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10103,
+      "name": "Meter Reading electric month3",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10104,
+      "name": "Meter Reading electric month4",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10105,
+      "name": "Meter Reading electric month5",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10106,
+      "name": "Meter Reading electric month6",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10107,
+      "name": "Meter Reading Current Month",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10108,
+      "name": "Meter Reading Last Month",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10200,
+      "name": "Meter Reading ACTUAL cooling",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10201,
+      "name": "Meter Reading cooling month1",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10202,
+      "name": "Meter Reading cooling month2",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10203,
+      "name": "Meter Reading cooling month3",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10204,
+      "name": "Meter Reading cooling month4",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10205,
+      "name": "Meter Reading cooling month5",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10206,
+      "name": "Meter Reading cooling month6",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10300,
+      "name": "Meter Reading ACTUAL heating",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10301,
+      "name": "Meter Reading heating month1",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10302,
+      "name": "Meter Reading heating month2",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10303,
+      "name": "Meter Reading heating month3",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10304,
+      "name": "Meter Reading heating month4",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10305,
+      "name": "Meter Reading heating month5",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 10306,
+      "name": "Meter Reading heating month6",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 15000,
+      "name": "EZNS_A_BL",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 15001,
+      "name": "EZNS_B_BL",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 15002,
+      "name": "EZNS_C_BL",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 15003,
+      "name": "EZNS_D_BL",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 999999,
+      "name": "Version",
+      "type": "analog-value",
+      "writable": true
+    },
+    {
+      "instance": 11,
+      "name": "Mode Switch Input",
+      "type": "binary-input",
+      "writable": false
+    },
+    {
+      "instance": 105,
+      "name": "Room_A DNS24 PIR",
+      "type": "binary-input",
+      "writable": false
+    },
+    {
+      "instance": 205,
+      "name": "Room_B DNS24 PIR",
+      "type": "binary-input",
+      "writable": false
+    },
+    {
+      "instance": 305,
+      "name": "Room_C DNS24 PIR",
+      "type": "binary-input",
+      "writable": false
+    },
+    {
+      "instance": 405,
+      "name": "Room_D DNS24 PIR",
+      "type": "binary-input",
+      "writable": false
+    },
+    {
+      "instance": 505,
+      "name": "Room_E DNS24 PIR",
+      "type": "binary-input",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "FCU Run Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 2,
+      "name": "Towel Rail HIU Override",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 3,
+      "name": "rim",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 13,
+      "name": "BMS Run Signal",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 16,
+      "name": "Fabric Protection Active",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 20,
+      "name": "Master Alarm",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 21,
+      "name": "Generic Alarm",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 22,
+      "name": "Filter Alarm",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 23,
+      "name": "Condensate Alarm",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 24,
+      "name": "Fan Failure Alarm",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 25,
+      "name": "Sensor Failure Alarm",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 28,
+      "name": "Element Cutout Alarm",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 30,
+      "name": "Replace Filter Alarm",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 51,
+      "name": "Fan 1 Delay Active",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 52,
+      "name": "Fan 2 Delay Active",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 53,
+      "name": "Recently Changed Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 64,
+      "name": "Heating Element Delay Active",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 70,
+      "name": "Save to Flash Required",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 71,
+      "name": "Load from Flash Required",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 80,
+      "name": "Update Outputs",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 81,
+      "name": "Reset Run Time Alarm",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 82,
+      "name": "Clear Manual Overrides",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 83,
+      "name": "Allow Manual Overrides to Persist",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 90,
+      "name": "Reset BACstat Setpoint on BMS Stop Signal",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 91,
+      "name": "Dual Setpoints Enabled",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1100,
+      "name": "Stored Reset",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1101,
+      "name": "Room_A Run Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1102,
+      "name": "Room_A Occupancy Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1103,
+      "name": "Room_A Run Status Stored",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1201,
+      "name": "Room_B Run Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1202,
+      "name": "Room_B Occupancy Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1203,
+      "name": "Room_B Run Status Stored",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1301,
+      "name": "Room_C Run Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1302,
+      "name": "Room_C Occupancy Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1303,
+      "name": "Room_C Run Status Stored",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1401,
+      "name": "Room_D Run Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1402,
+      "name": "Room_D Occupancy Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1403,
+      "name": "Room_D Run Status Stored",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1501,
+      "name": "Room_E Run Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1502,
+      "name": "Room_E Occupancy Status",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 1503,
+      "name": "Room_E Run Status Stored",
+      "type": "binary-value",
+      "writable": true
+    },
+    {
+      "instance": 753016,
+      "name": "C305",
+      "type": "device",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Database Transfer File",
+      "type": "file",
+      "writable": false
+    },
+    {
+      "instance": 2,
+      "name": "Supply Air Control Loop",
+      "type": "loop",
+      "writable": false
+    },
+    {
+      "instance": 3,
+      "name": "Heating Valve/Element Control Loop",
+      "type": "loop",
+      "writable": false
+    },
+    {
+      "instance": 4,
+      "name": "Cooling Valve Control Loop",
+      "type": "loop",
+      "writable": false
+    },
+    {
+      "instance": 1100,
+      "name": "Room_A Thermal Control Loop",
+      "type": "loop",
+      "writable": false
+    },
+    {
+      "instance": 1200,
+      "name": "Room_B Thermal Control Loop",
+      "type": "loop",
+      "writable": false
+    },
+    {
+      "instance": 1300,
+      "name": "Room_C Thermal Control Loop",
+      "type": "loop",
+      "writable": false
+    },
+    {
+      "instance": 1400,
+      "name": "Room_D Thermal Control Loop",
+      "type": "loop",
+      "writable": false
+    },
+    {
+      "instance": 1500,
+      "name": "Room_E Thermal Control Loop",
+      "type": "loop",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Main",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 2,
+      "name": "Control Calculations",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 3,
+      "name": "Status Calculations",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 4,
+      "name": "Fan Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 5,
+      "name": "Valve Setup Calculations",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 6,
+      "name": "Occupancy Calculations",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 7,
+      "name": "Valve Control",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 8,
+      "name": "Flow Rate Calculations",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 9,
+      "name": "Low Priority Calculations",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 10,
+      "name": "Dual Setpoint Adjust",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 11,
+      "name": "Status Light Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 12,
+      "name": "Run Status Control",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 13,
+      "name": "Heating Element Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 14,
+      "name": "Data Exchange",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 15,
+      "name": "Fan Program 2",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 17,
+      "name": "Powerup Procedure",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 18,
+      "name": "Alarm Calculations",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 26,
+      "name": "Meter Reading Module",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 50,
+      "name": "Store Fan Status",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 100,
+      "name": "Room_A Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 105,
+      "name": "Room_A BACstat Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 106,
+      "name": "Room_A Setpoint Control",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 200,
+      "name": "Room_B Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 205,
+      "name": "Room_B BACstat Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 206,
+      "name": "Room_B Setpoint Control",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 300,
+      "name": "Room_C Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 305,
+      "name": "Room_C BACstat Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 306,
+      "name": "Room_C Setpoint Control",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 400,
+      "name": "Room_D Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 405,
+      "name": "Room_D BACstat Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 406,
+      "name": "Room_D Setpoint Control",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 500,
+      "name": "Room_E Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 505,
+      "name": "Room_E BACstat Program",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 506,
+      "name": "Room_E Setpoint Control",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 555,
+      "name": "WHS Additional",
+      "type": "program",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "FCU Operating Mode",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 3,
+      "name": "Heating Valve Status",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 4,
+      "name": "Cooling Valve Status",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 7,
+      "name": "Fan 1 Configuration",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 8,
+      "name": "Fan 2 Configuration",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 9,
+      "name": "Fan 3 Configuration",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 10,
+      "name": "Fan 4 Configuration",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 11,
+      "name": "Fan 5 Configuration",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 201,
+      "name": "FCU Size",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 203,
+      "name": "Heating Valve/Actuator Type",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 204,
+      "name": "Cooling Valve/Actuator Type",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 213,
+      "name": "Heating Valve Demand",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 214,
+      "name": "Cooling Valve Demand",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1101,
+      "name": "Room_A Run Status Control",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1102,
+      "name": "Room_A Occupancy Control",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1201,
+      "name": "multi-state-value #1201",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1202,
+      "name": "Room_B Occupancy Control",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1301,
+      "name": "Room_C Run Status Control",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1302,
+      "name": "Room_C Occupancy Control",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1401,
+      "name": "Room_D Run Status Control",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1402,
+      "name": "Room_D Occupancy Control",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1501,
+      "name": "Room_E Run Status Control",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1502,
+      "name": "Room_E Occupancy Control",
+      "type": "multi-state-value",
+      "writable": true
+    },
+    {
+      "instance": 1,
+      "name": "DEL1__AV1101_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 2,
+      "name": "DEL2__AV1201_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 3,
+      "name": "DEL3__AV1301_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 5,
+      "name": "DEL5__AV1501_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 6,
+      "name": "DEL6__AV10100_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 7,
+      "name": "DEL7__AV10101_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 8,
+      "name": "DEL8__AV10102_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 9,
+      "name": "DEL9__AV10103_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 10,
+      "name": "DEL10__AV10104_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 11,
+      "name": "DEL11__AV10105_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 12,
+      "name": "DEL12__AV10106_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 13,
+      "name": "DEL13__AV10200_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 14,
+      "name": "DEL14__AV10201_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 15,
+      "name": "DEL15__AV10202_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 16,
+      "name": "DEL16__AV10203_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 17,
+      "name": "DEL17__AV10204_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 18,
+      "name": "DEL18__AV10205_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 19,
+      "name": "DEL19__AV10206_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 20,
+      "name": "DEL20__AV10300_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 21,
+      "name": "DEL21__AV10301_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 22,
+      "name": "DEL22__AV10302_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 23,
+      "name": "DEL23__AV10303_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 24,
+      "name": "DEL24__AV10304_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 25,
+      "name": "DEL25__AV10305_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 26,
+      "name": "DEL26__AV10306_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 27,
+      "name": "DEL27__BV1_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 28,
+      "name": "DEL28__BV13_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 29,
+      "name": "DEL29__MV1_85",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Data Exchange Settings 753016",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Temperature 10K -40-150 degC AIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 2,
+      "name": "0v-10v AIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 3,
+      "name": "eZNS OnBoard Temperature degC AIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Fan 0-10V AOC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 2,
+      "name": "Occupied_Unoccupied BDC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 8,
+      "name": "Running/Stopped BDC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "FCU Run Timer",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 753016,
+      "name": "Database Information 753016",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Fan Configuration MIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 3,
+      "name": "FCU Size MIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 4,
+      "name": "Heating Valve Type MIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 8,
+      "name": "Multi-Function Input MIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 9,
+      "name": "FCU Mode MIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 10,
+      "name": "Valve Type MIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 13,
+      "name": "Valve Status",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 14,
+      "name": "Room Control MIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 15,
+      "name": "Cooling Valve Type MIC",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 16,
+      "name": "Flow Demand",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "DELTA",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "BACnet Settings 753016",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 101,
+      "name": "Room_A BACstat",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 201,
+      "name": "Room_B BACstat",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 301,
+      "name": "Room_C BACstat",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 401,
+      "name": "Room_D BACstat",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 501,
+      "name": "Room_E BACstat",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "EVN1",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 2,
+      "name": "EVN2",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 3,
+      "name": "EVN3",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 4,
+      "name": "EVN4",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 5,
+      "name": "EVN5",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 6,
+      "name": "EVN6",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 7,
+      "name": "EVN7",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 8,
+      "name": "EVN8",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 9,
+      "name": "EVN9",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 10,
+      "name": "EVN10",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "EVA1",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 2,
+      "name": "EVA2",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 3,
+      "name": "EVA3",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 4,
+      "name": "EVA4",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 5,
+      "name": "EVA5",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 6,
+      "name": "EVA6",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 7,
+      "name": "EVA7",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 8,
+      "name": "EVA8",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 9,
+      "name": "EVA9",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 10,
+      "name": "EVA10",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 11,
+      "name": "EVA11",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 12,
+      "name": "EVA12",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 13,
+      "name": "EVA13",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 14,
+      "name": "EVA14",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 15,
+      "name": "EVA15",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 16,
+      "name": "EVA16",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 17,
+      "name": "EVA17",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 18,
+      "name": "EVA18",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 19,
+      "name": "EVA19",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 20,
+      "name": "EVA20",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Event and Alarm Settings 753016",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Priority Names 753016",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Meter Bus",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Meter Reading Translator",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 2,
+      "name": "Meter Reading Translator 2",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 3,
+      "name": "Meter Reading Translator 3",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Slave Device List 753016",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "BBMD List1 753016",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Administrator",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 101,
+      "name": "Room_A BACstat Status",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 201,
+      "name": "Room_B BACstat Status",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 301,
+      "name": "Room_C BACstat Status",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 401,
+      "name": "Room_D BACstat Status",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 501,
+      "name": "Room_E BACstat Status",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Device Route Table 753016",
+      "type": "unknown",
+      "writable": false
+    },
+    {
+      "instance": 1,
+      "name": "Internet Protocol Settings",
+      "type": "unknown",
+      "writable": false
+    }
+  ],
+  "ok": true
+}

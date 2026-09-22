@@ -16,3 +16,4 @@ CONFIG_EXAMPLE_ETH_SPI_PHY_RST0_GPIO=16
 # The legacy WROOM-32D has 4 MiB flash. Its custom partition table reserves
 # two OTA slots and the coredump partition within that capacity.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ENABLE_ESP_MATTER=n

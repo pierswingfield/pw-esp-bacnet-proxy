@@ -126,9 +126,12 @@ in the T-ETH-Lite architecture document.
 
 ## Planned Future Roadmap
 
-- [ ] **Native Apple HomeKit Integration**: Embedded HAP (HomeKit Accessory Protocol) server on the ESP32 for direct pairing with Apple Home without external middleware.
-- [ ] **Native Google Home Integration**: Local Matter / Google Home Local SDK support for direct voice and app control via Google Assistant.
-- [ ] **Native Amazon Alexa Integration**: Direct local Alexa Smart Home Skill integration for native voice control.
+- [ ] **Local Matter integration**: One Matter-over-Wi-Fi module for direct
+  Apple Home, Google Home and Alexa control on the T-ETH-Lite profile. MQTT /
+  Home Assistant remains an optional integration, not a prerequisite.
+
+The implementation assessment, hardware scope and staged verification plan are
+in [`docs/MATTER_INTEGRATION_ASSESSMENT_AND_PLAN.md`](docs/MATTER_INTEGRATION_ASSESSMENT_AND_PLAN.md).
 
 ---
 
