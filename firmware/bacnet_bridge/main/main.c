@@ -2312,6 +2312,9 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
     bool sys_power = false;
     bool sys_power_valid = BacnetReady && read_bool_property(
         OBJECT_BINARY_VALUE, SYS_POWER_READBACK_INSTANCE, PROP_PRESENT_VALUE, &sys_power);
+    bool sys_power_commanded = false;
+    bool sys_power_commanded_valid = BacnetReady && read_bool_property(
+        OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, &sys_power_commanded);
 
     unsigned boost_mode = 0;
     bool boost_valid = BacnetReady &&
@@ -2322,10 +2325,12 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
     off += snprintf(
         buf + off, sizeof(buf) - off,
         "{\"sys_power_valid\":%s,\"sys_power\":%s,"
+        "\"sys_power_commanded_valid\":%s,\"sys_power_commanded\":%s,"
         "\"boost_valid\":%s,\"boost_mode\":%u,"
         "\"boost_timeout_minutes\":%u,\"boost_remaining_minutes\":%d,"
         "\"rooms\":[",
         sys_power_valid ? "true" : "false", sys_power ? "true" : "false",
+        sys_power_commanded_valid ? "true" : "false", sys_power_commanded ? "true" : "false",
         boost_valid ? "true" : "false", boost_mode,
         (unsigned)BoostTimeoutMinutes, boost_remaining_minutes());
 
@@ -2972,31 +2977,16 @@ static esp_err_t api_room_power_post_handler(httpd_req_t *req)
 static const httpd_uri_t api_room_power_uri = {
     .uri = "/api/room-power", .method = HTTP_POST, .handler = api_room_power_post_handler};
 
-/* BV:13 (System Power) does not gate the per-room power points: the FCU keeps
- * each room's last commanded state, so a stale room switch silently restarts the
- * unit. Cascade OFF only - a master ON must not force unoccupied rooms on. */
-static bool any_active_room_power_on(void)
+/* BV:13 is the point we write - reading it back reports exactly what was
+ * last commanded, independent of whether anything is actually running
+ * (BV:1, "Running now") and independent of per-room state. Room power is
+ * deliberately left untouched by System Power: they're functionally
+ * separate so the same room configuration survives a system-off/on cycle
+ * without the user re-setting anything. */
+static bool system_power_commanded(bool *out_val)
 {
-    if (!BacnetReady) return false;
-    for (size_t i = 0; i < RoomCount; i++) {
-        if (!Rooms[i].active) continue;
-        bool on = false;
-        if (read_bool_property(OBJECT_BINARY_VALUE, Rooms[i].power_instance,
-                               PROP_PRESENT_VALUE, &on) && on) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void cascade_rooms_off(void)
-{
-    if (!BacnetReady) return;
-    for (size_t i = 0; i < RoomCount; i++) {
-        if (!Rooms[i].active) continue;
-        write_bool_property(OBJECT_BINARY_VALUE, Rooms[i].power_instance,
-                            PROP_PRESENT_VALUE, false);
-    }
+    if (!BacnetReady || !out_val) return false;
+    return read_bool_property(OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, out_val);
 }
 
 static esp_err_t api_system_power_post_handler(httpd_req_t *req)
@@ -3016,7 +3006,6 @@ static esp_err_t api_system_power_post_handler(httpd_req_t *req)
     bool on = strcmp(value_str, "on") == 0;
     bool ok = BacnetReady && write_bool_property(
         OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, on);
-    if (ok && !on) cascade_rooms_off();
     diag_log("system-power value=%s ok=%d", value_str, ok);
     send_write_result(req, ok, NULL);
     return ESP_OK;
@@ -4928,8 +4917,8 @@ static esp_err_t api_mqtt_entities_get_handler(httpd_req_t *req)
     bool first = true;
 
     /* Core 1: System Power */
-    bool sys_pwr_ok = BacnetReady;
-    bool sys_pwr = sys_pwr_ok && any_active_room_power_on();
+    bool sys_pwr = false;
+    bool sys_pwr_ok = system_power_commanded(&sys_pwr);
     len = snprintf(chunk, sizeof(chunk),
                    "%s{\"name\":\"System Power\",\"group\":\"core\",\"type\":\"switch\","
                    "\"unique_id\":\"%s_system_power\",\"topic\":\"%s/system_power/state\","
@@ -6261,6 +6250,17 @@ static void mqtt_publish_room_action(size_t room_idx)
         }
         return;
     }
+    /* Room power stays whatever the user configured even while System Power
+     * is off - only the reported action goes idle, so the room's own on/off
+     * setting survives a system-off/on cycle untouched. */
+    bool sys_power_commanded = true;
+    system_power_commanded(&sys_power_commanded);
+    if (!sys_power_commanded) {
+        if (MqttClient && MqttConnected) {
+            esp_mqtt_client_publish(MqttClient, topic, "idle", 0, 1, true);
+        }
+        return;
+    }
     float current_output;
     if (read_real_property(
             OBJECT_ANALOG_VALUE, Rooms[room_idx].current_output_instance, PROP_PRESENT_VALUE,
@@ -6291,12 +6291,12 @@ static void mqtt_handle_command(const char *topic, const char *data)
         bool on = strcasecmp(data, "ON") == 0 || strcasecmp(data, "1") == 0 || strcasecmp(data, "true") == 0;
         if (BacnetReady) {
             write_bool_property(OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, on);
-            if (!on) cascade_rooms_off();
         }
         snprintf(match_topic, sizeof(match_topic), "%s/system_power/state", MqttTopicBase);
         if (MqttClient && MqttConnected) {
-            esp_mqtt_client_publish(MqttClient, match_topic,
-                                    any_active_room_power_on() ? "ON" : "OFF", 0, 1, true);
+            bool commanded = false;
+            system_power_commanded(&commanded);
+            esp_mqtt_client_publish(MqttClient, match_topic, commanded ? "ON" : "OFF", 0, 1, true);
         }
         return;
     }
@@ -6613,8 +6613,8 @@ static void mqtt_state_task(void *arg)
                the httpd handler timing added the same night. */
             int64_t __bacnet_burst_start_us = esp_timer_get_time();
             diag_log("bacnet poll burst start");
-            {
-                bool sys_power = any_active_room_power_on();
+            bool sys_power;
+            if (system_power_commanded(&sys_power)) {
                 char st_top[96];
                 snprintf(st_top, sizeof(st_top), "%s/system_power/state", MqttTopicBase);
                 esp_mqtt_client_publish(

@@ -188,7 +188,7 @@
       var BOOST_NAMES = { 1: 'Auto', 2: 'Commissioning', 3: 'Flushing', 4: 'Full Heat', 5: 'Full Cool', 6: 'Neutral' };
       var BOOST_MODE_AUTO = 1;
 
-      function renderRooms(rooms) {
+      function renderRooms(rooms, systemCommandedOff) {
         var container = document.getElementById('roomsContainer');
         container.innerHTML = '';
         rooms.forEach(function(room, idx) {
@@ -197,7 +197,9 @@
 
           var temp = room.temperature_valid ? room.temperature.toFixed(1) + '°C' : 'Unavailable';
           var setpointVal = room.setpoint_valid ? room.setpoint.toFixed(1) : '';
+          var roomIsIdle = room.power_valid && room.power && systemCommandedOff;
           var power = room.power_valid ? (room.power ? 'On' : 'Off') : 'Unavailable';
+          if (roomIsIdle) power += ' (Idle - system off)';
           var toggleLabel = room.power_valid ? (room.power ? 'Turn Off' : 'Turn On') : 'Unavailable';
           var toggleCls = room.power_valid ? (room.power ? 'is-on' : 'is-off') : '';
 
@@ -249,16 +251,16 @@
 
           var sysToggle = document.getElementById('sysPowerToggleBtn');
           if (!sysToggle.classList.contains('is-busy')) {
-            sysToggle.disabled = !s.sys_power_valid;
+            sysToggle.disabled = !s.sys_power_commanded_valid;
             sysToggle.classList.remove('is-on', 'is-off');
-            if (s.sys_power_valid) {
-              sysToggle.textContent = s.sys_power ? 'Turn Off' : 'Turn On';
-              sysToggle.classList.add(s.sys_power ? 'is-on' : 'is-off');
+            if (s.sys_power_commanded_valid) {
+              sysToggle.textContent = s.sys_power_commanded ? 'Turn Off' : 'Turn On';
+              sysToggle.classList.add(s.sys_power_commanded ? 'is-on' : 'is-off');
             } else {
               sysToggle.textContent = 'Unavailable';
             }
           }
-          sysToggle.dataset.currentlyOn = s.sys_power_valid && s.sys_power ? '1' : '0';
+          sysToggle.dataset.currentlyOn = s.sys_power_commanded_valid && s.sys_power_commanded ? '1' : '0';
 
           if (s.boost_valid) {
             setText('boostMode', BOOST_NAMES[s.boost_mode] || ('Mode ' + s.boost_mode), 'ok');
@@ -280,7 +282,7 @@
             note.textContent = '';
           }
 
-          renderRooms(s.rooms || []);
+          renderRooms(s.rooms || [], s.sys_power_commanded_valid && !s.sys_power_commanded);
           setBanner('');
         }).catch(function() {
           setBanner('Status request failed - try Refresh.', 'error');
