@@ -1583,6 +1583,9 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
     bool sys_power = false;
     bool sys_power_valid = BacnetReady && read_bool_property(
         OBJECT_BINARY_VALUE, SYS_POWER_READBACK_INSTANCE, PROP_PRESENT_VALUE, &sys_power);
+    bool sys_power_commanded = false;
+    bool sys_power_commanded_valid = BacnetReady &&
+        hvac_core_get_system_power_commanded(&sys_power_commanded);
 
     unsigned boost_mode = 0;
     bool boost_valid = BacnetReady &&
@@ -1593,11 +1596,13 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
     off += snprintf(
         buf + off, sizeof(buf) - off,
         "{\"sys_power_valid\":%s,\"sys_power\":%s,"
+        "\"sys_power_commanded_valid\":%s,\"sys_power_commanded\":%s,"
         "\"boost_valid\":%s,\"boost_mode\":%u,"
         "\"boost_timeout_minutes\":%u,\"boost_remaining_minutes\":%d,"
         "\"integration_mode\":%d,"
         "\"rooms\":[",
         sys_power_valid ? "true" : "false", sys_power ? "true" : "false",
+        sys_power_commanded_valid ? "true" : "false", sys_power_commanded ? "true" : "false",
         boost_valid ? "true" : "false", boost_mode,
         (unsigned)BoostTimeoutMinutes, boost_remaining_minutes(),
         (int)hvac_core_integration_get());
@@ -4124,8 +4129,8 @@ static esp_err_t api_mqtt_entities_get_handler(httpd_req_t *req)
     bool first = true;
 
     /* Core 1: System Power */
-    bool sys_pwr_ok = BacnetReady;
-    bool sys_pwr = sys_pwr_ok && hvac_core_any_room_power_on();
+    bool sys_pwr = false;
+    bool sys_pwr_ok = BacnetReady && hvac_core_get_system_power_commanded(&sys_pwr);
     len = snprintf(chunk, sizeof(chunk),
                    "%s{\"name\":\"System Power\",\"group\":\"core\",\"type\":\"switch\","
                    "\"unique_id\":\"%s_system_power\",\"topic\":\"%s/system_power/state\","
@@ -5478,6 +5483,17 @@ static void mqtt_publish_room_action(size_t room_idx)
         }
         return;
     }
+    /* Room power stays whatever the user configured even while System Power
+     * is off - only the reported action goes idle, so the room's own on/off
+     * setting survives a system-off/on cycle untouched. */
+    bool sys_power_commanded = true;
+    hvac_core_get_system_power_commanded(&sys_power_commanded);
+    if (!sys_power_commanded) {
+        if (MqttClient && MqttConnected) {
+            esp_mqtt_client_publish(MqttClient, topic, "idle", 0, 1, true);
+        }
+        return;
+    }
     float current_output;
     if (read_real_property(
             OBJECT_ANALOG_VALUE, Rooms[room_idx].current_output_instance, PROP_PRESENT_VALUE,
@@ -5509,8 +5525,9 @@ static void mqtt_handle_command(const char *topic, const char *data)
         hvac_command_system_power(on);
         snprintf(match_topic, sizeof(match_topic), "%s/system_power/state", MqttTopicBase);
         if (MqttClient && MqttConnected) {
-            esp_mqtt_client_publish(MqttClient, match_topic,
-                                    hvac_core_any_room_power_on() ? "ON" : "OFF", 0, 1, true);
+            bool commanded = false;
+            hvac_core_get_system_power_commanded(&commanded);
+            esp_mqtt_client_publish(MqttClient, match_topic, commanded ? "ON" : "OFF", 0, 1, true);
         }
         return;
     }
@@ -5839,8 +5856,8 @@ static void mqtt_state_task(void *arg)
                the httpd handler timing added the same night. */
             int64_t __bacnet_burst_start_us = esp_timer_get_time();
             diag_log("bacnet poll burst start");
-            {
-                bool sys_power = hvac_core_any_room_power_on();
+            bool sys_power;
+            if (hvac_core_get_system_power_commanded(&sys_power)) {
                 char st_top[96];
                 snprintf(st_top, sizeof(st_top), "%s/system_power/state", MqttTopicBase);
                 esp_mqtt_client_publish(

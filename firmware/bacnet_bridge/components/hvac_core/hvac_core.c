@@ -200,16 +200,10 @@ bool hvac_core_set_room_power(size_t room_idx, bool on)
 
 bool hvac_core_set_system_power(bool on)
 {
-    bool ok = bacnet_worker_write_bool(OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, on);
-    /* BV:13 does not gate the room points - a stale room switch would restart the
-     * unit. Cascade OFF only; a master ON must not force unoccupied rooms on. */
-    if (ok && !on) {
-        for (size_t i = 0; i < HvacRoomCount; i++) {
-            if (!HvacRooms[i].active) continue;
-            hvac_core_set_room_power(i, false);
-        }
-    }
-    return ok;
+    /* Room power is deliberately untouched here: system power and room power
+     * are functionally separate so the same room configuration survives a
+     * system-off/on cycle without the user re-setting anything. */
+    return bacnet_worker_write_bool(OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, on);
 }
 
 bool hvac_core_get_room_setpoint(size_t room_idx, float *out_val)
@@ -236,12 +230,11 @@ bool hvac_core_get_system_power(bool *out_val)
     return bacnet_worker_read_bool(OBJECT_BINARY_VALUE, SYS_POWER_READBACK_INSTANCE, PROP_PRESENT_VALUE, out_val);
 }
 
-bool hvac_core_any_room_power_on(void)
+bool hvac_core_get_system_power_commanded(bool *out_val)
 {
-    for (size_t i = 0; i < HvacRoomCount; i++) {
-        if (!HvacRooms[i].active) continue;
-        bool on = false;
-        if (hvac_core_get_room_power(i, &on) && on) return true;
-    }
-    return false;
+    /* BV:13 is the point we write - reading it back reports exactly what was
+     * last commanded, independent of whether anything is actually running
+     * (BV:1, "Running now") and independent of per-room state. */
+    if (!out_val) return false;
+    return bacnet_worker_read_bool(OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, out_val);
 }

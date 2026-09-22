@@ -76,7 +76,7 @@ bool hvac_core_get_room_setpoint(size_t room_idx, float *out_val);
 bool hvac_core_get_room_temp(size_t room_idx, float *out_val);
 bool hvac_core_get_room_power(size_t room_idx, bool *out_val);
 bool hvac_core_get_system_power(bool *out_val);
-bool hvac_core_any_room_power_on(void);
+bool hvac_core_get_system_power_commanded(bool *out_val);
 
 #ifdef __cplusplus
 }
