@@ -179,6 +179,8 @@ Returns general climate system state, boost timers, and per-room statuses.
   {
     "sys_power": true,
     "sys_power_valid": true,
+    "sys_power_commanded": true,
+    "sys_power_commanded_valid": true,
     "boost_mode": 0,
     "boost_valid": true,
     "boost_timeout_minutes": 60,
@@ -201,6 +203,16 @@ Returns general climate system state, boost timers, and per-room statuses.
     ]
   }
   ```
+  `sys_power`/`sys_power_valid` is the raw `FCU Run Status` readback
+  (`binary-value:1`) — "is anything actually running," which can legitimately
+  diverge from what was commanded (a wall panel or PIR can hold the unit
+  running). `sys_power_commanded`/`sys_power_commanded_valid` reads back
+  `BMS Run Signal` (`binary-value:13`), the point the bridge writes — "what
+  did we last tell it to do." The System Power toggle (web UI and HA) is
+  driven by the latter, not the former. System power and room power are
+  independent: turning system power off never writes to any room's power
+  point, so the same room configuration survives a system-off/on cycle
+  untouched. See `docs/SYSTEM_POWER_CASCADE_PLAN.md` for the full history.
 
 #### `GET /api/health`
 Returns live FCU health, thermal duty delivery, coil flow, signed Air Delta across coil, performance ratings, and deterministic system diagnostics:
