@@ -1,5 +1,59 @@
 # Backlog
 
+## HTTP "Connection reset by peer" under sustained polling - root-caused (2026-09-23)
+
+Open since 2026-09-12 ("one open HTTP-reset bug not yet root-caused" -
+ping stays healthy at 7-8ms, HTTP stops accepting new connections,
+confirmed persistent/non-self-resolving at the time). Root-caused live by
+a second Claude session working in parallel tonight, reproduced reliably
+via the object scan's status-polling (`/api/objects/scan-status` every
+~4s) — died at t=38s/55% through a scan with `httpd_accept_conn: error in
+accept (23)` on serial (errno 23 = ENFILE, system-wide socket table
+exhausted).
+
+Eliminated as causes (each independently confirmed, not assumed):
+- **BACnet's own networking**: `bip_init()` opens exactly one UDP socket
+  once at worker startup; the scan dispatches through the existing
+  worker queue and never calls `socket()` itself.
+- **Two httpd instances**: `start_provisioning_ap()` and
+  `start_connected_webserver()` (main.c ~5580/~5700) are mutually
+  exclusive within a boot (provisioning only runs when STA connect
+  fails), never concurrent - only one 8-socket httpd pool ever exists.
+- **espressif__mdns**: off by default (`MdnsEnabled` gates
+  `mdns_start_service()`), not a factor unless a user opts in; its
+  create/delete socket pairing in `mdns_networking_socket.c` also looks
+  correctly guarded on every path checked.
+- **Matter's entire networking stack**: `UDPEndPointImplLwIP.cpp`
+  (connectedhomeip `src/inet/`) uses raw lwIP PCBs (`udp_new`/`struct
+  udp_pcb`), never calls `socket()`. Matter's own minimal-mDNS
+  advertisement (`src/lib/dnssd/minimal_mdns/Server.cpp`, the
+  `_matterc._udp`/`_matter._tcp` advertisement) delegates to the same
+  `chip::Inet::UDPEndPoint` - same conclusion. Neither Matter's main
+  protocol traffic nor its own discovery touches the BSD-socket/fd table
+  ENFILE exhausted, structurally.
+
+**Likely actual cause**: not a leak anywhere in this codebase. Both httpd
+instances have `lru_purge_enable=true` (main.c ~5622/~5734), so httpd's
+own 8-socket pool never overflows - it evicts its own least-recently-used
+connection to make room. But that only updates httpd's internal
+bookkeeping; the underlying closed TCP socket still enters `TIME_WAIT` at
+the lwIP/OS level independently, and lingers there regardless (standard
+~30-60s). At ~4s polling, overlapping `TIME_WAIT` entries accumulate in
+the shared `CONFIG_LWIP_MAX_SOCKETS=16` system-wide table faster than
+they expire, stacking on BACnet's 1 permanently-open socket, until
+`accept()` itself fails with ENFILE regardless of what httpd's own pool
+thinks it has room for. Timing fits: ~38s at ~4s/poll is roughly the
+point enough overlapping `TIME_WAIT` sockets would pile up.
+
+**Fix options, cheapest to most involved**: slow the scan-status poll
+interval; raise `CONFIG_LWIP_MAX_SOCKETS` for headroom (buys more time
+before tripping, doesn't fix the underlying pattern); move scan-status
+polling to a persistent connection (WebSocket/SSE) instead of repeated
+short-lived GETs, which would eliminate the `TIME_WAIT` churn entirely -
+this is the only option among the three that actually removes the root
+cause rather than pushing the ceiling further out. Given the object scan
+already needs a progress-indicator UX pass, worth doing both together.
+
 ## Hardcoded-assumption sweep (2026-09-23)
 
 Prompted by finding the room-config truncation bug while stress-testing
@@ -52,15 +106,12 @@ to `-1`, `-2`, etc. on collision.
   `rooms.json`'s per-room instances) where the scan **suggests** candidates
   by matching object names against expected patterns, and a human
   confirms - not blind auto-detection.
-- **`HVAC_CORE_MAX_ROOMS` (8) and `CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT`
-  (16) are two independent constants that must be kept in sync by hand**:
-  at 8 rooms the Matter side needs aggregator(1) + system(1) + boost(2) +
-  rooms(8) = 12 of the 16 available dynamic endpoints. Raising
-  `HVAC_CORE_MAX_ROOMS` alone in the future (e.g. to 12, for a larger
-  home) would silently exceed the Matter endpoint budget at 16 rooms'
-  worth of config without any build-time check tying the two together -
-  worth a `static_assert` or Kconfig cross-check rather than relying on
-  whoever changes one constant remembering to check the other.
+~~**`HVAC_CORE_MAX_ROOMS` (8) and `CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT`
+(16) were two independent constants kept in sync by hand**~~ - fixed: a
+`static_assert` in `matter_adapter.cpp` now fails the build if
+`HVAC_CORE_MAX_ROOMS + 4` (aggregator + system + 2 boost switches)
+exceeds the configured Matter endpoint budget, instead of silently
+overflowing it at runtime.
 
 ## Automatic updates
 
@@ -129,15 +180,6 @@ to `-1`, `-2`, etc. on collision.
   single-purpose `/smart-home` page; review layout, copy and information
   density now that it sits inside the merged module-switcher page rather
   than as a standalone destination.
-
-## Object scanning UX
-
-- The Objects page scan gives no progress indication beyond the raw
-  percentage text and doesn't warn the user up front that the web UI
-  becomes unresponsive while a scan runs (it walks the controller's full
-  object list over BACnet, one ReadProperty per object, and the HTTP task
-  is busy driving that). Add a visible progress bar and a clear warning
-  before the scan starts, not just a number that updates via polling.
 
 ## Firmware release consolidation
 

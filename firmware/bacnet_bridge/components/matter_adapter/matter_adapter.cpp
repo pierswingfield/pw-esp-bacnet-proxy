@@ -47,6 +47,17 @@ static constexpr uint32_t kMatterSyncStackBytes = 8192;
 static constexpr uint32_t kMatterSyncStackWords = kMatterSyncStackBytes / sizeof(StackType_t);
 static_assert(kMatterSyncStackBytes % sizeof(StackType_t) == 0,
               "Matter sync stack must have an integral FreeRTOS word count");
+
+/* HVAC_CORE_MAX_ROOMS and CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT are
+ * two independent constants (hvac_core.h vs esp_matter's Kconfig) with
+ * nothing tying them together at build time - raising room capacity alone
+ * would silently exceed Matter's endpoint budget instead of failing loudly.
+ * Endpoint count at full room capacity: 1 aggregator + 1 system switch + 2
+ * boost switches + one endpoint per room (matter_adapter_init below). */
+static_assert(HVAC_CORE_MAX_ROOMS + 4 <= CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT,
+              "HVAC_CORE_MAX_ROOMS + 4 (aggregator + system + 2 boost switches) must "
+              "fit within CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT - raise the "
+              "latter (sdkconfig) if you raise HVAC_CORE_MAX_ROOMS");
 static matter_system_power_write_cb_t s_system_power_write_cb = nullptr;
 static matter_system_power_read_cb_t s_system_power_read_cb = nullptr;
 
