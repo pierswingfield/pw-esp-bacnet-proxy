@@ -70,6 +70,7 @@
       .module-card p { font-size:0.78em; margin:0.35em 0 0 0; color:#64748b; line-height:1.35; }
     </style>
     <title>Setup Wizard - ESP32 BACnet Bridge</title>
+    <script src="/points.js"></script>
   </head>
   <body>
     <div class="container">
@@ -195,17 +196,13 @@
           </div>
 
           <div class="decision-item" style="margin-top:0.6em;">
-            <strong>3. System Power &amp; Boost Control:</strong>
-            <span class="tag ok">Auto-Mapped</span>
-            <div class="decision-desc">Master FCU Run Signal, Run Status readback, and Operating Mode verified.</div>
-          </div>
-
-          <div class="decision-item" style="margin-top:0.6em;">
-            <strong>4. Health &amp; Diagnostics Telemetry:</strong>
-            <span class="tag ok">Live Binding</span>
-            <div class="decision-desc">Bound thermal outputs, coil flow rates, valve signals, return air, and fault alarms.</div>
+            <strong>3. Control &amp; Diagnostic Points:</strong>
+            <span class="tag neutral" id="decPoints">Scanning...</span>
+            <div class="decision-desc" id="decPointsDesc">Matching the controller's object names to system power, Boost and Health read-outs...</div>
           </div>
         </div>
+
+        <div id="pointMapper"></div>
 
         <div class="card" style="margin-top:1em;">
           <h3>Live Controller Telemetry</h3>
@@ -216,7 +213,7 @@
 
         <div class="btn-row">
           <button type="button" onclick="gotoStep(2)">&larr; Back</button>
-          <button type="button" class="primary" onclick="gotoStep(4)">Proceed to Rooms &rarr;</button>
+          <button type="button" class="primary" id="btnStep3Next">Proceed to Rooms &rarr;</button>
         </div>
       </div>
 
@@ -332,13 +329,14 @@
         <div class="card">
           <div class="row"><span class="label">BACnet Controller</span><span class="value ok" id="revBacTarget">-</span></div>
           <div class="row"><span class="label">Configured Fan Count</span><span class="value" id="revFans">-</span></div>
+          <div class="row"><span class="label">Controller Points</span><span class="value" id="revPoints">-</span></div>
           <div class="row"><span class="label">Active Rooms</span><span class="value" id="revRooms">-</span></div>
           <div class="row"><span class="label">Automation</span><span class="value ok" id="revIntegration">-</span></div>
           <div class="row" id="revMqttRow"><span class="label">MQTT Broker</span><span class="value" id="revMqtt">-</span></div>
           <div class="row" id="revHaDiscRow"><span class="label">HA Discovery</span><span class="value ok" id="revHaDisc">Enabled</span></div>
         </div>
 
-        <p class="note" style="margin-top:1em;">Clicking <strong>Save &amp; Launch</strong> will store settings in non-volatile flash memory, bind the room points, connect to your MQTT broker, and publish Home Assistant discovery entities.</p>
+        <p class="note" style="margin-top:1em;">Clicking <strong>Save &amp; Launch</strong> will store settings in non-volatile flash memory, bind the room and controller points, connect to your MQTT broker, and publish Home Assistant discovery entities.</p>
 
         <div id="saveFeedback" style="font-size:0.9em; margin-top:0.5em;"></div>
 
@@ -382,7 +380,7 @@
         window.scrollTo(0, 0);
 
         if (step === 2) loadBacnetStatus();
-        if (step === 3) loadAnalysis();
+        if (step === 3) loadAnalysis().then(startPointMapper);
         if (step === 4) {
           loadAnalysis().then(function() { renderRoomEditor(); });
         }
@@ -618,6 +616,37 @@
         });
       }
 
+      // Step 3: controller point mapping (scan -> name match -> confirm).
+      // The scan starts automatically; the proposal is applied with the rest
+      // of the setup on Save & Launch, not before.
+      var pointMapper = null;
+      var pointSummary = null;
+      function startPointMapper() {
+        if (pointMapper || typeof PointMapper === 'undefined') return;
+        pointMapper = new PointMapper(document.getElementById('pointMapper'), {
+          autoScan: true,
+          onChange: function(s) {
+            pointSummary = s;
+            var tag = document.getElementById('decPoints');
+            var desc = document.getElementById('decPointsDesc');
+            if (!s.scanned) {
+              tag.textContent = 'Not scanned';
+              tag.className = 'tag warn';
+              desc.textContent = 'The controller could not be scanned - the current point map is kept. You can map points later from the Objects page.';
+              return;
+            }
+            tag.textContent = s.matched + ' of ' + s.total + ' matched';
+            tag.className = 'tag ' + (s.missingControl.length ? 'warn' : (s.missing.length ? 'info' : 'ok'));
+            desc.textContent = s.missingControl.length
+              ? 'Pick the missing essential control point(s) below before continuing.'
+              : (s.missing.length
+                  ? 'System power and Boost matched. Some diagnostics were not found - they are optional.'
+                  : 'System power, Boost and all Health diagnostics matched by name.');
+          }
+        });
+        pointMapper.start();
+      }
+
       // Step 4: Room Editor & Interactive Identification
       function toggleShowAllSlots() {
         showAllSlots = !showAllSlots;
@@ -842,6 +871,15 @@
       // Step 6: Review & Finish
       function prepareReview() {
         document.getElementById('revBacTarget').textContent = discoveredDev.name + ' (' + (discoveredDev.ip || '10.0.3.16') + ')';
+        var revPoints = document.getElementById('revPoints');
+        if (pointSummary && pointSummary.scanned) {
+          revPoints.textContent = pointSummary.matched + ' of ' + pointSummary.total + ' mapped' +
+            (pointSummary.missingControl.length ? ' (missing: ' + pointSummary.missingControl.join(', ') + ')' : '');
+          revPoints.className = 'value ' + (pointSummary.missingControl.length ? 'bad' : 'ok');
+        } else {
+          revPoints.textContent = 'Not scanned - current map kept';
+          revPoints.className = 'value amber';
+        }
         document.getElementById('revFans').textContent = (detectedFanCount || 1) + (detectedFanCount === 1 ? ' Fan' : ' Fans');
         var activeRooms = [];
         detectedRooms.forEach(function(r) {
@@ -904,6 +942,8 @@
           ha_device_id: 'bacnet_' + (discoveredDev.instance || 'bridge'),
           ha_discovery: document.getElementById('haDiscEn').checked
         };
+        var pointsPayload = pointMapper ? pointMapper.payload() : null;
+        if (pointsPayload) payload.points = pointsPayload;
 
         fetch('/api/wizard/finish', {
           method: 'POST',
@@ -952,6 +992,14 @@
         });
       }
       document.getElementById('btnStep2Next').addEventListener('click', function() { gotoStep(3); });
+      document.getElementById('btnStep3Next').addEventListener('click', function() {
+        if (pointSummary && pointSummary.scanned && pointSummary.missingControl.length &&
+            !window.confirm(pointSummary.missingControl.join(', ') + ' could not be matched. Without it the matching ' +
+                            'on/off or Boost control will not work. Continue anyway?')) {
+          return;
+        }
+        gotoStep(4);
+      });
       document.getElementById('btnStep4Next').addEventListener('click', function() { gotoStep(5); });
       document.getElementById('btnTestMqtt').addEventListener('click', testMqtt);
       document.getElementById('btnScanMqtt').addEventListener('click', scanMqttBrokers);

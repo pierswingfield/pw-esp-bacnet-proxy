@@ -1,4 +1,4 @@
 idf_component_register(SRCS "main.c"
                         INCLUDE_DIRS "."
-                        EMBED_FILES "root.html" "manage.html" "status.html" "health.html" "reset.html" "update.html" "objects.html" "wizard.html" "smart_home.html"
+                        EMBED_FILES "root.html" "manage.html" "status.html" "health.html" "reset.html" "update.html" "objects.html" "wizard.html" "smart_home.html" "points.js"
                         REQUIRES ethernet_init bacnet_client hvac_core matter_adapter esp_netif esp_eth dns_server nvs_flash esp_wifi esp_http_server mqtt app_update mbedtls mdns)

@@ -64,6 +64,9 @@ This project was built from deep on-wire discovery and protocol analysis of the 
    - The ESP32 firmware implements a fast **unicast `Who-Is` sweep** across `10.0.3.1` to `10.0.3.32` on the controller subnet, complemented by a direct IP probe option in the web Setup Wizard.
 3. **Safe Control Write Targets & Priority array**:
    - **System Power**: Controlled via `BMS Run Signal` (`binary-value, 13`). Readback uses `FCU Run Status` (`binary-value, 1`).
+     These, the Boost/operating-mode object and the 18 Health diagnostics are the
+     reference defaults only: each install confirms its own mapping (see
+     *Controller point mapping* below).
    - **Room Power**: Controlled via `Room_x Run Status` (`binary-value, 1101/1201/1301/1401/1501`).
    - **Room Setpoints**: Written via `Room_x Setpoint` (`analog-value, 1100/1200/1300/1400/1500`).
    - Differential snapshot diffing confirmed that room writes apply directly at priority 16 without needing to fight internal controller programs or override selector objects.
@@ -77,6 +80,14 @@ This project was built from deep on-wire discovery and protocol analysis of the 
 - **Dual-Interface Isolation**: Hardware SPI Ethernet (`10.0.3.x`) stays completely isolated from your home WiFi network (`192.168.x.x`).
 - **Captive Portal First-Boot**: Zero-app setup. On first boot, connects to `ESP-BACnet-Setup` SoftAP to configure home WiFi.
 - **On-Device Web Setup Wizard**: Guides target discovery, room selection, and MQTT broker setup.
+- **Controller Point Mapping**: The setup wizard scans the controller and
+  matches object names to the 21 whole-unit points the bridge uses (system
+  power command/readback, Boost mode, Health diagnostics). Confident matches
+  are proposed with a score; anything uncertain is shown as missing, never
+  guessed. Every point can be searched and overridden, and the confirmed map
+  is stored in NVS. Re-run it any time from **Objects → Controller point
+  mapping**. Installs that never confirm a map keep the reference Delta
+  DAC-1180E map.
 - **Home Assistant Auto-Discovery**: Provisions full `climate` entities for every configured room zone, system power toggles, boost mode controls, and individual temperature sensors over MQTT.
 - **Dynamic Object Browser & Scanner**: Live on-wire BACnet object browser capable of scanning 400+ objects; the T-ETH-Lite scan worker and temporary catalog use PSRAM, and `tools/bacnet_object_scan.py` exports its JSON catalog from a workstation.
 - **Circular In-Memory Logs Console**: Real-time diagnostic console accessible from the Web UI (`/health`) showing live BACnet transactions and network events.

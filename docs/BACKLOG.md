@@ -27,31 +27,16 @@ that runs DHCP now gets a correct address automatically.
 existing responder on the default name before claiming it, falls back
 to `-1`, `-2`, etc. on collision.
 
-- **System power/boost/health object instance numbers are hardcoded to
-  this specific Delta DAC-1180E's program**: `SYS_POWER_WRITE_INSTANCE`,
-  `SYS_POWER_READBACK_INSTANCE`, `BOOST_INSTANCE`, and the full
-  `HEALTH_*_INSTANCE` set (~18 macros) in `main.c` are fixed constants
-  tied to this one controller's verified point map ("confirmed via Phase
-  0.5 diff"). Unlike room setpoint/temperature/power instances - which
-  *are* per-install configurable via `rooms.json` - there is no UI or
-  config path to remap these for a different Delta unit's programming, a
-  different FCU controller model, or a different vendor's BACnet device
-  entirely. Anyone deploying this against different controller logic
-  needs a firmware rebuild, not a settings change.
-  Also found while scoping this: the same constants are independently
-  `#define`'d in both `main.c` and `hvac_core/include/hvac_core.h` (kept
-  in sync by hand today) - any fix needs to pick one owner first, or it
-  just adds a second place to forget to update.
-  Feasibility: making these *configurable* (NVS-backed, same pattern as
-  `rooms.json`) is straightforward - the object scan already walks
-  `PROP_OBJECT_LIST` and reads names, so the read side exists. Making
-  them *automatic* is not realistically feasible: BACnet has no semantic
-  tag for "this MSV is the boost mode" - even this controller's mapping
-  only exists because it was manually diffed against known-good/known-bad
-  states (Phase 0.5). The practical version is a points-mapping UI (like
-  `rooms.json`'s per-room instances) where the scan **suggests** candidates
-  by matching object names against expected patterns, and a human
-  confirms - not blind auto-detection.
+~~**System power/boost/health object instance numbers were hardcoded to
+this specific Delta DAC-1180E's program**~~ - fixed: `hvac_core` now owns
+all 21 whole-unit points (the duplicate `SYS_POWER_*` defines in `main.c`
+and `hvac_core.h` are gone). The wizard scans the controller, matches
+object names against per-point patterns in the browser, proposes confident
+matches with a score and flags the rest as missing; the installer confirms
+or overrides and the map is stored in `nvs_points`. Still fixed per-program:
+the Boost state numbers (1/4/5), the fan supply-air/speed instance lists and
+the alarm binary-values used by the Health page.
+
 - **`HVAC_CORE_MAX_ROOMS` (8) and `CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT`
   (16) are two independent constants that must be kept in sync by hand**:
   at 8 rooms the Matter side needs aggregator(1) + system(1) + boost(2) +

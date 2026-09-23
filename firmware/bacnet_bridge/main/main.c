@@ -301,9 +301,10 @@ static uint16_t TargetPort = DEFAULT_TARGET_PORT;
 #define LOCAL_NETMASK "255.255.0.0"
 #define LOCAL_GATEWAY "0.0.0.0"
 
-#define SYS_POWER_WRITE_INSTANCE 13 /* `BMS Run Signal` (binary-value) - confirmed write target */
-#define SYS_POWER_READBACK_INSTANCE 1 /* `FCU Run Status` (binary-value) - read-only, can diverge from BMS Run Signal */
-#define BOOST_INSTANCE 1 /* `FCU Operating Mode` (multi-state-value) - confirmed via Phase 0.5 diff */
+/* System power (command + readback) and the boost/operating-mode object are
+   per-install mappings owned by hvac_core (HVAC_POINT_*), not constants here.
+   The mode numbers below are the reference program's multi-state values for
+   that object - confirmed via Phase 0.5 diff. */
 #define BOOST_MODE_AUTO 1
 #define BOOST_MODE_FULL_HEATING 4
 #define BOOST_MODE_FULL_COOLING 5
@@ -318,6 +319,7 @@ static int64_t BoostDeadlineUs = 0;
 
 static bool boost_apply(unsigned mode, bool self_initiated);
 static bool app_config_save(void);
+static bool points_any_confirmed(void);
 
 static bool matter_system_power_write(bool on);
 static bool matter_system_power_read(bool *out_on);
@@ -451,34 +453,13 @@ static bool pairing_store(hvac_pairing_status_t status)
 }
 
 
-/* Whole-unit health/performance objects, confirmed to exist with matching
-   name/units against discovery/device_753016_epics.txt (not yet individually
-   live-tested via ReadProperty - see architecture-plan.md). Naming keeps the
-   "Cooling Valve"/"Fan N" qualifiers from the real object names rather than
-   the generic "Flow"/"Supply Air" labels an earlier draft of this page used,
+/* Whole-unit health/performance objects (design duty, outputs, valve flows
+   and signals, return air, fan count, valve status) are per-install
+   mappings owned by hvac_core - see PointDefs in hvac_core.c for each
+   point's reference object and the notes on how it was verified. Naming
+   keeps the "Cooling Valve"/"Fan N" qualifiers from the real object names,
    since this unit also has separate heating-valve and per-fan objects that
-   those generic names would collide with. */
-/* Design (nameplate) max, NOT a live demand - useful as the reference the
-   "required" figure gets pinned to when the unit is forced to full output.
-   Confirmed on real hardware: reads 4.40 kW, identical to what
-   `Overall Required Cooling Output` reports while Boost is in Full Cooling. */
-#define HEALTH_DESIGN_COOLING_DUTY_INSTANCE 25 /* AV: "FCU Design Cooling Duty (Sensible)" (kW) */
-#define HEALTH_COOLING_OUTPUT_INSTANCE 26   /* AV: "Overall Current Cooling Output" (kW) */
-#define HEALTH_REQUIRED_OUTPUT_INSTANCE 27  /* AV: "Overall Required Cooling Output" (kW) */
-#define HEALTH_COOLING_FLOW_INSTANCE 42     /* AV: "Cooling Valve Current Flow Rate" (L/s) */
-#define HEALTH_REQUIRED_FLOW_INSTANCE 43    /* AV: "Cooling Valve Required Flow Rate" (L/s) */
-#define HEALTH_FLOW_DESIGN_PCT_INSTANCE 45  /* AV: "Cooling Valve Percentage of Design Flow" (%), controller-computed */
-#define HEALTH_VALVE_SIGNAL_INSTANCE 8      /* AO: "Cooling Valve Control Signal" (%) */
-
-#define HEALTH_DESIGN_HEATING_DUTY_INSTANCE 20 /* AV: "FCU Design Heating Duty" (kW) */
-#define HEALTH_HEATING_OUTPUT_INSTANCE 21      /* AV: "Overall Current Heating Output" (kW) */
-#define HEALTH_REQUIRED_HEATING_OUTPUT_INSTANCE 22 /* AV: "Overall Required Heating Output" (kW) */
-#define HEALTH_HEATING_FLOW_INSTANCE 32        /* AV: "Heating Valve Current Flow Rate" (L/s) */
-#define HEALTH_REQUIRED_HEATING_FLOW_INSTANCE 33 /* AV: "Heating Valve Required Flow Rate" (L/s) */
-#define HEALTH_HEATING_FLOW_DESIGN_PCT_INSTANCE 35 /* AV: "Heating Valve Percentage of Design Flow" (%) */
-#define HEALTH_HEATING_VALVE_SIGNAL_INSTANCE 7 /* AO: "Heating Valve / Element 1 Control Signal" (%) */
-
-#define HEALTH_RETURN_AIR_INSTANCE 9        /* AI: "Return Air Temperature Sensor" */
+   generic names would collide with. */
 /* AI:1-5 are "Fan N Supply Air Temperature Sensor" - not every unit has all
    5 fans wired/enabled, so the health handler reads all 5 and averages
    whichever ones succeed rather than assuming a fixed count. */
@@ -501,8 +482,8 @@ static const uint32_t HealthFanSpeedInstances[HEALTH_FAN_SPEED_COUNT] = {1, 2, 3
    thermistor), but channel 3 reads a perfectly plausible ~20.5C despite
    there being no third fan - so a plausibility range alone would NOT have
    caught it. The fan count is the authoritative filter; the range check
-   below is only a secondary signal for a fitted-but-faulty sensor. */
-#define HEALTH_FAN_COUNT_INSTANCE 50 /* AV: "Number of FCU Fans" */
+   below is only a secondary signal for a fitted-but-faulty sensor.
+   (Read through HVAC_POINT_FAN_COUNT.) */
 #define PLAUSIBLE_TEMP_MIN_C (-10.0f)
 #define PLAUSIBLE_TEMP_MAX_C 60.0f
 static inline bool temp_is_plausible(float c)
@@ -510,8 +491,7 @@ static inline bool temp_is_plausible(float c)
     return c >= PLAUSIBLE_TEMP_MIN_C && c <= PLAUSIBLE_TEMP_MAX_C;
 }
 
-#define HEALTH_COOLING_VALVE_STATUS_INSTANCE 4 /* MSV: "Cooling Valve Status" - 1=CLOSED 2=CONTROLLING 3=RESYNCING */
-#define HEALTH_HEATING_VALVE_STATUS_INSTANCE 3 /* MSV: "Heating Valve Status" - same state text */
+/* Valve status points (HVAC_POINT_*_VALVE_STATUS): 1=CLOSED 2=CONTROLLING 3=RESYNCING */
 static const char *HealthValveStatusNames[] = {"Unknown", "Closed", "Controlling", "Resyncing"};
 
 /* Alarm binary-values: active-text/inactive-text confirmed "ON"/"OFF" in the
@@ -654,8 +634,7 @@ static bool matter_boost_read(matter_system_mode_t *out_mode)
 {
     if (!out_mode) return false;
     unsigned boost_mode = BOOST_MODE_AUTO;
-    if (BacnetReady && read_msv_property(OBJECT_MULTI_STATE_VALUE, BOOST_INSTANCE,
-                                         PROP_PRESENT_VALUE, &boost_mode)) {
+    if (BacnetReady && hvac_core_point_read_multistate(HVAC_POINT_BOOST_MODE, &boost_mode)) {
         if (boost_mode == BOOST_MODE_FULL_HEATING) {
             *out_mode = MATTER_SYSTEM_MODE_HEAT;
             return true;
@@ -1102,6 +1081,8 @@ extern const char wizard_page_start[] asm("_binary_wizard_html_start");
 extern const char wizard_page_end[] asm("_binary_wizard_html_end");
 extern const char smart_home_page_start[] asm("_binary_smart_home_html_start");
 extern const char smart_home_page_end[] asm("_binary_smart_home_html_end");
+extern const char points_js_start[] asm("_binary_points_js_start");
+extern const char points_js_end[] asm("_binary_points_js_end");
 
 static const char *TAG_WIFI = "wifi_prov";
 static EventGroupHandle_t WifiEventGroup;
@@ -1824,15 +1805,14 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
         return ESP_OK;
     }
     bool sys_power = false;
-    bool sys_power_valid = BacnetReady && read_bool_property(
-        OBJECT_BINARY_VALUE, SYS_POWER_READBACK_INSTANCE, PROP_PRESENT_VALUE, &sys_power);
+    bool sys_power_valid = BacnetReady && hvac_core_point_read_bool(HVAC_POINT_SYS_POWER_READBACK, &sys_power);
     bool sys_power_commanded = false;
     bool sys_power_commanded_valid = BacnetReady &&
         hvac_core_get_system_power_commanded(&sys_power_commanded);
 
     unsigned boost_mode = 0;
     bool boost_valid = BacnetReady &&
-        read_msv_property(OBJECT_MULTI_STATE_VALUE, BOOST_INSTANCE, PROP_PRESENT_VALUE, &boost_mode);
+        hvac_core_point_read_multistate(HVAC_POINT_BOOST_MODE, &boost_mode);
 
     char buf[1536];
     size_t off = 0;
@@ -1841,12 +1821,16 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
         "{\"sys_power_valid\":%s,\"sys_power\":%s,"
         "\"sys_power_commanded_valid\":%s,\"sys_power_commanded\":%s,"
         "\"boost_valid\":%s,\"boost_mode\":%u,"
+        "\"sys_power_mapped\":%s,\"boost_mapped\":%s,\"points_confirmed\":%s,"
         "\"boost_timeout_minutes\":%u,\"boost_remaining_minutes\":%d,"
         "\"integration_mode\":%d,"
         "\"rooms\":[",
         sys_power_valid ? "true" : "false", sys_power ? "true" : "false",
         sys_power_commanded_valid ? "true" : "false", sys_power_commanded ? "true" : "false",
         boost_valid ? "true" : "false", boost_mode,
+        hvac_core_point_get(HVAC_POINT_SYS_POWER_WRITE, NULL, NULL) ? "true" : "false",
+        hvac_core_point_get(HVAC_POINT_BOOST_MODE, NULL, NULL) ? "true" : "false",
+        points_any_confirmed() ? "true" : "false",
         (unsigned)BoostTimeoutMinutes, boost_remaining_minutes(),
         (int)hvac_core_integration_get());
 
@@ -1905,59 +1889,41 @@ static esp_err_t api_health_get_handler(httpd_req_t *req)
     }
     /* Cooling metrics */
     float cooling_output = 0.0f, required_cooling_output = 0.0f;
-    bool cooling_output_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_COOLING_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &cooling_output);
-    bool required_cooling_output_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_REQUIRED_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &required_cooling_output);
+    bool cooling_output_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_COOLING_OUTPUT, &cooling_output);
+    bool required_cooling_output_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_REQUIRED_COOLING_OUTPUT, &required_cooling_output);
 
     float design_cooling_duty = 0.0f;
-    bool design_cooling_duty_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_DESIGN_COOLING_DUTY_INSTANCE, PROP_PRESENT_VALUE,
-        &design_cooling_duty);
+    bool design_cooling_duty_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_DESIGN_COOLING_DUTY, &design_cooling_duty);
 
     float cooling_flow = 0.0f, required_cooling_flow = 0.0f, cooling_flow_design_pct = 0.0f;
-    bool cooling_flow_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_COOLING_FLOW_INSTANCE, PROP_PRESENT_VALUE, &cooling_flow);
-    bool required_cooling_flow_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_REQUIRED_FLOW_INSTANCE, PROP_PRESENT_VALUE, &required_cooling_flow);
-    bool cooling_flow_design_pct_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_FLOW_DESIGN_PCT_INSTANCE, PROP_PRESENT_VALUE, &cooling_flow_design_pct);
+    bool cooling_flow_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_COOLING_FLOW, &cooling_flow);
+    bool required_cooling_flow_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_REQUIRED_COOLING_FLOW, &required_cooling_flow);
+    bool cooling_flow_design_pct_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_COOLING_FLOW_DESIGN_PCT, &cooling_flow_design_pct);
 
     float cooling_valve_signal = 0.0f;
-    bool cooling_valve_signal_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_OUTPUT, HEALTH_VALVE_SIGNAL_INSTANCE, PROP_PRESENT_VALUE, &cooling_valve_signal);
+    bool cooling_valve_signal_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_COOLING_VALVE_SIGNAL, &cooling_valve_signal);
 
     /* Heating metrics */
     float heating_output = 0.0f, required_heating_output = 0.0f;
-    bool heating_output_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_HEATING_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &heating_output);
-    bool required_heating_output_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_REQUIRED_HEATING_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &required_heating_output);
+    bool heating_output_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_HEATING_OUTPUT, &heating_output);
+    bool required_heating_output_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_REQUIRED_HEATING_OUTPUT, &required_heating_output);
 
     float design_heating_duty = 0.0f;
-    bool design_heating_duty_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_DESIGN_HEATING_DUTY_INSTANCE, PROP_PRESENT_VALUE,
-        &design_heating_duty);
+    bool design_heating_duty_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_DESIGN_HEATING_DUTY, &design_heating_duty);
 
     float heating_flow = 0.0f, required_heating_flow = 0.0f, heating_flow_design_pct = 0.0f;
-    bool heating_flow_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_HEATING_FLOW_INSTANCE, PROP_PRESENT_VALUE, &heating_flow);
-    bool required_heating_flow_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_REQUIRED_HEATING_FLOW_INSTANCE, PROP_PRESENT_VALUE, &required_heating_flow);
-    bool heating_flow_design_pct_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_HEATING_FLOW_DESIGN_PCT_INSTANCE, PROP_PRESENT_VALUE, &heating_flow_design_pct);
+    bool heating_flow_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_HEATING_FLOW, &heating_flow);
+    bool required_heating_flow_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_REQUIRED_HEATING_FLOW, &required_heating_flow);
+    bool heating_flow_design_pct_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_HEATING_FLOW_DESIGN_PCT, &heating_flow_design_pct);
 
     float heating_valve_signal = 0.0f;
-    bool heating_valve_signal_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_OUTPUT, HEALTH_HEATING_VALVE_SIGNAL_INSTANCE, PROP_PRESENT_VALUE, &heating_valve_signal);
+    bool heating_valve_signal_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_HEATING_VALVE_SIGNAL, &heating_valve_signal);
 
     float return_air = 0.0f;
-    bool return_air_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_INPUT, HEALTH_RETURN_AIR_INSTANCE, PROP_PRESENT_VALUE, &return_air);
+    bool return_air_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_RETURN_AIR, &return_air);
 
     float fan_count_raw = 0.0f;
-    bool fan_count_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_FAN_COUNT_INSTANCE, PROP_PRESENT_VALUE, &fan_count_raw);
+    bool fan_count_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_FAN_COUNT, &fan_count_raw);
     int fan_count = 0;
     if (fan_count_valid) {
         fan_count = (int)(fan_count_raw + 0.5f);
@@ -2024,12 +1990,8 @@ static esp_err_t api_health_get_handler(httpd_req_t *req)
     }
 
     unsigned cooling_valve_status = 0, heating_valve_status = 0;
-    bool cooling_valve_status_valid = BacnetReady && read_msv_property(
-        OBJECT_MULTI_STATE_VALUE, HEALTH_COOLING_VALVE_STATUS_INSTANCE, PROP_PRESENT_VALUE,
-        &cooling_valve_status);
-    bool heating_valve_status_valid = BacnetReady && read_msv_property(
-        OBJECT_MULTI_STATE_VALUE, HEALTH_HEATING_VALVE_STATUS_INSTANCE, PROP_PRESENT_VALUE,
-        &heating_valve_status);
+    bool cooling_valve_status_valid = BacnetReady && hvac_core_point_read_multistate(HVAC_POINT_COOLING_VALVE_STATUS, &cooling_valve_status);
+    bool heating_valve_status_valid = BacnetReady && hvac_core_point_read_multistate(HVAC_POINT_HEATING_VALVE_STATUS, &heating_valve_status);
 
     char buf[4096];
     size_t off = 0;
@@ -4168,8 +4130,7 @@ static const httpd_uri_t api_bacnet_discover_uri = {
 static esp_err_t api_strategy_inspect_handler(httpd_req_t *req)
 {
     float fan_count_raw = 0.0f;
-    bool fan_count_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_FAN_COUNT_INSTANCE, PROP_PRESENT_VALUE, &fan_count_raw);
+    bool fan_count_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_FAN_COUNT, &fan_count_raw);
     int fan_count = fan_count_valid ? (int)(fan_count_raw + 0.5f) : 0;
 
     int plausible_fans = 0;
@@ -4186,8 +4147,7 @@ static esp_err_t api_strategy_inspect_handler(httpd_req_t *req)
     }
 
     float design_duty = 0.0f;
-    bool design_duty_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_DESIGN_COOLING_DUTY_INSTANCE, PROP_PRESENT_VALUE, &design_duty);
+    bool design_duty_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_DESIGN_COOLING_DUTY, &design_duty);
 
     char buf[3072];
     size_t off = snprintf(
@@ -4361,6 +4321,254 @@ static esp_err_t api_rooms_post_handler(httpd_req_t *req)
 }
 static const httpd_uri_t api_rooms_post_uri = {
     .uri = "/api/rooms", .method = HTTP_POST, .handler = api_rooms_post_handler};
+
+/* ===================== Whole-unit point mapping ===================== */
+/* The definitions (labels, patterns, compatible types) live in hvac_core's
+   flash-resident table; matching scanned names against the patterns happens
+   in the browser (points.js) over the existing PSRAM scan catalogue, so the
+   device only ever stores the confirmed result: one u32 per point. */
+
+static const char *point_kind_name(hvac_point_kind_t kind)
+{
+    switch (kind) {
+    case HVAC_POINT_KIND_BOOL: return "bool";
+    case HVAC_POINT_KIND_MULTISTATE: return "multistate";
+    default: return "real";
+    }
+}
+
+static const char *point_source_name(hvac_point_source_t source)
+{
+    switch (source) {
+    case HVAC_POINT_SOURCE_CONFIRMED: return "confirmed";
+    case HVAC_POINT_SOURCE_UNMAPPED: return "unmapped";
+    default: return "default";
+    }
+}
+
+static bool points_any_confirmed(void)
+{
+    for (size_t i = 0; i < HVAC_POINT_COUNT; i++) {
+        if (hvac_core_point_source((hvac_point_id_t)i) != HVAC_POINT_SOURCE_DEFAULT) return true;
+    }
+    return false;
+}
+
+static bool points_find(const char *key, hvac_point_id_t *out)
+{
+    for (size_t i = 0; i < HVAC_POINT_COUNT; i++) {
+        if (strcmp(hvac_core_point_def((hvac_point_id_t)i)->key, key) == 0) {
+            *out = (hvac_point_id_t)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static esp_err_t api_points_get_handler(httpd_req_t *req)
+{
+    /* ~450 B per point; streamed one point at a time instead of building a
+       ~10 KB document, so the only buffer is this 1 KB chunk on the stack. */
+    static const uint16_t candidate_types[] = {
+        OBJECT_ANALOG_INPUT, OBJECT_ANALOG_OUTPUT, OBJECT_ANALOG_VALUE,
+        OBJECT_BINARY_INPUT, OBJECT_BINARY_OUTPUT, OBJECT_BINARY_VALUE,
+        OBJECT_MULTI_STATE_INPUT, OBJECT_MULTI_STATE_OUTPUT, OBJECT_MULTI_STATE_VALUE};
+    char chunk[1024];
+    char esc_a[256], esc_b[160];
+    httpd_resp_set_type(req, "application/json");
+    int len = snprintf(chunk, sizeof(chunk), "{\"ok\":true,\"confirmed\":%s,\"points\":[",
+                       points_any_confirmed() ? "true" : "false");
+    httpd_resp_send_chunk(req, chunk, len);
+    for (size_t i = 0; i < HVAC_POINT_COUNT; i++) {
+        hvac_point_id_t id = (hvac_point_id_t)i;
+        const hvac_point_def_t *def = hvac_core_point_def(id);
+        uint16_t type = 0;
+        uint32_t instance = 0;
+        bool mapped = hvac_core_point_get(id, &type, &instance);
+        size_t off = 0;
+        json_escape(esc_a, def->description, sizeof(esc_a));
+        off += snprintf(chunk + off, sizeof(chunk) - off,
+            "%s{\"id\":\"%s\",\"label\":\"%s\",\"group\":\"%s\",\"kind\":\"%s\",\"writable\":%s,"
+            "\"description\":\"%s\",",
+            i == 0 ? "" : ",", def->key, def->label, def->group, point_kind_name(def->kind),
+            def->writable ? "true" : "false", esc_a);
+        json_escape(esc_a, def->pattern, sizeof(esc_a));
+        json_escape(esc_b, def->reference_name, sizeof(esc_b));
+        off += snprintf(chunk + off, sizeof(chunk) - off,
+            "\"pattern\":\"%s\",\"reference_name\":\"%s\",\"default\":{\"type\":\"%s\",\"instance\":%u},\"types\":[",
+            esc_a, esc_b, bactext_object_type_name(def->default_type), (unsigned)def->default_instance);
+        bool first_type = true;
+        for (size_t t = 0; t < sizeof(candidate_types) / sizeof(candidate_types[0]); t++) {
+            if (!hvac_core_point_type_ok(id, candidate_types[t])) continue;
+            off += snprintf(chunk + off, sizeof(chunk) - off, "%s\"%s\"",
+                            first_type ? "" : ",", bactext_object_type_name(candidate_types[t]));
+            first_type = false;
+        }
+        if (mapped) {
+            off += snprintf(chunk + off, sizeof(chunk) - off,
+                "],\"source\":\"%s\",\"mapped\":true,\"type\":\"%s\",\"instance\":%u}",
+                point_source_name(hvac_core_point_source(id)), bactext_object_type_name(type),
+                (unsigned)instance);
+        } else {
+            off += snprintf(chunk + off, sizeof(chunk) - off,
+                "],\"source\":\"%s\",\"mapped\":false,\"type\":null,\"instance\":null}",
+                point_source_name(hvac_core_point_source(id)));
+        }
+        if (off >= sizeof(chunk)) off = sizeof(chunk) - 1; /* cannot happen with the table's string lengths */
+        httpd_resp_send_chunk(req, chunk, off);
+    }
+    httpd_resp_send_chunk(req, "]}", 2);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+static const httpd_uri_t api_points_get_uri = {
+    .uri = "/api/points", .method = HTTP_GET, .handler = api_points_get_handler};
+
+typedef struct {
+    bool present;
+    bool mapped;
+    uint16_t type;
+    uint32_t instance;
+} point_update_t;
+
+/* Parses {"points":[{"id":..,"mapped":bool,"type":"..","instance":N},..]}
+   into `updates` (indexed by point id) without touching the live map, so a
+   bad entry rejects the whole request instead of half-applying it. Returns
+   the number of points present, or -1 with `err` set. */
+static int parse_points_json(const char *body, point_update_t updates[HVAC_POINT_COUNT],
+                             char *err, size_t err_len)
+{
+    memset(updates, 0, sizeof(point_update_t) * HVAC_POINT_COUNT);
+    const char *p = strstr(body, "\"points\"");
+    const char *arr = p ? strchr(p, '[') : NULL;
+    if (!arr) {
+        snprintf(err, err_len, "missing points array");
+        return -1;
+    }
+    const char *arr_end = strchr(arr, ']');
+    int count = 0;
+    const char *obj = arr;
+    while ((obj = strchr(obj, '{')) != NULL && (!arr_end || obj < arr_end)) {
+        const char *end_obj = strchr(obj, '}');
+        if (!end_obj) break;
+        char item[192];
+        size_t len = (size_t)(end_obj - obj + 1);
+        if (len >= sizeof(item)) len = sizeof(item) - 1;
+        memcpy(item, obj, len);
+        item[len] = '\0';
+        obj = end_obj + 1;
+
+        char key[20] = {0};
+        hvac_point_id_t id;
+        if (!json_get_str(item, "id", key, sizeof(key)) || !points_find(key, &id)) {
+            snprintf(err, err_len, "unknown point id '%s'", key);
+            return -1;
+        }
+        bool mapped = true;
+        json_get_bool(item, "mapped", &mapped);
+        point_update_t *u = &updates[id];
+        u->present = true;
+        u->mapped = mapped;
+        if (mapped) {
+            char tstr[32] = {0};
+            int inst = -1;
+            BACNET_OBJECT_TYPE otype;
+            if (!json_get_str(item, "type", tstr, sizeof(tstr)) || !parse_object_type(tstr, &otype) ||
+                !json_get_int(item, "instance", &inst) || inst < 0 || inst >= BACNET_MAX_INSTANCE) {
+                snprintf(err, err_len, "%s: needs a valid type and instance", key);
+                return -1;
+            }
+            if (!hvac_core_point_type_ok(id, (uint16_t)otype)) {
+                snprintf(err, err_len, "%s: a %s cannot be used for this point", key, tstr);
+                return -1;
+            }
+            u->type = (uint16_t)otype;
+            u->instance = (uint32_t)inst;
+        }
+        count++;
+    }
+    return count;
+}
+
+static void points_apply(const point_update_t updates[HVAC_POINT_COUNT])
+{
+    for (size_t i = 0; i < HVAC_POINT_COUNT; i++) {
+        if (updates[i].present) {
+            hvac_core_point_set((hvac_point_id_t)i, updates[i].mapped, updates[i].type, updates[i].instance);
+        }
+    }
+}
+
+static bool points_save_direct(void *arg)
+{
+    (void)arg;
+    return hvac_core_points_save();
+}
+
+static bool points_erase_direct(void *arg)
+{
+    (void)arg;
+    hvac_core_points_erase();
+    return true;
+}
+
+static esp_err_t api_points_post_handler(httpd_req_t *req)
+{
+    char *body = NULL;
+    size_t body_len = 0;
+    if (!recv_full_body(req, &body, &body_len) || !body) {
+        if (body) free(body);
+        send_bad_request(req, "{\"ok\":false,\"error\":\"empty or oversized body\"}");
+        return ESP_OK;
+    }
+    bool reset = false;
+    json_get_bool(body, "reset", &reset);
+    if (reset) {
+        free(body);
+        bool ok = run_internal_flash_op(points_erase_direct, NULL);
+        diag_log("points: reset to reference map ok=%d", ok);
+        send_write_result(req, ok, NULL);
+        return ESP_OK;
+    }
+    /* 21 x 12 B - heap, not the (PSRAM) HTTPD stack, to keep the frame small. */
+    point_update_t *updates = calloc(HVAC_POINT_COUNT, sizeof(point_update_t));
+    if (!updates) {
+        free(body);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    char err[96] = {0};
+    int count = parse_points_json(body, updates, err, sizeof(err));
+    free(body);
+    if (count < 0) {
+        free(updates);
+        char resp[160], esc[128];
+        json_escape(esc, err, sizeof(esc));
+        snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"%s\"}", esc);
+        send_bad_request(req, resp);
+        return ESP_OK;
+    }
+    points_apply(updates);
+    free(updates);
+    bool ok = run_internal_flash_op(points_save_direct, NULL);
+    diag_log("points: %d confirmed ok=%d", count, ok);
+    /* Health/boost entities are published from the map - refresh them. */
+    mqtt_publish_discovery();
+    send_write_result(req, ok, NULL);
+    return ESP_OK;
+}
+static const httpd_uri_t api_points_post_uri = {
+    .uri = "/api/points", .method = HTTP_POST, .handler = api_points_post_handler};
+
+static esp_err_t points_js_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/javascript; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_send(req, points_js_start, points_js_end - points_js_start);
+    return ESP_OK;
+}
+static const httpd_uri_t points_js_uri = {
+    .uri = "/points.js", .method = HTTP_GET, .handler = points_js_get_handler};
 
 static esp_err_t api_integration_get_handler(httpd_req_t *req)
 {
@@ -4614,7 +4822,7 @@ static esp_err_t api_mqtt_entities_get_handler(httpd_req_t *req)
 
     /* Core 2: Boost Mode */
     unsigned bmode = 0;
-    bool bmode_ok = BacnetReady && read_msv_property(OBJECT_MULTI_STATE_VALUE, BOOST_INSTANCE, PROP_PRESENT_VALUE, &bmode);
+    bool bmode_ok = BacnetReady && hvac_core_point_read_multistate(HVAC_POINT_BOOST_MODE, &bmode);
     const char *bmode_str = "Unavailable";
     if (bmode_ok) {
         if (bmode == BOOST_MODE_AUTO) bmode_str = "auto";
@@ -4678,14 +4886,14 @@ static esp_err_t api_mqtt_entities_get_handler(httpd_req_t *req)
 
     /* Health Group */
     float h_out = 0.0f, h_req = 0.0f, h_flow_pct = 0.0f, h_ret = 0.0f;
-    bool h_out_ok = BacnetReady && read_real_property(OBJECT_ANALOG_VALUE, HEALTH_COOLING_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &h_out);
-    bool h_req_ok = BacnetReady && read_real_property(OBJECT_ANALOG_VALUE, HEALTH_REQUIRED_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &h_req);
-    bool h_fp_ok = BacnetReady && read_real_property(OBJECT_ANALOG_VALUE, HEALTH_FLOW_DESIGN_PCT_INSTANCE, PROP_PRESENT_VALUE, &h_flow_pct);
-    bool h_ret_ok = BacnetReady && read_real_property(OBJECT_ANALOG_INPUT, HEALTH_RETURN_AIR_INSTANCE, PROP_PRESENT_VALUE, &h_ret);
+    bool h_out_ok = BacnetReady && hvac_core_point_read_real(HVAC_POINT_COOLING_OUTPUT, &h_out);
+    bool h_req_ok = BacnetReady && hvac_core_point_read_real(HVAC_POINT_REQUIRED_COOLING_OUTPUT, &h_req);
+    bool h_fp_ok = BacnetReady && hvac_core_point_read_real(HVAC_POINT_COOLING_FLOW_DESIGN_PCT, &h_flow_pct);
+    bool h_ret_ok = BacnetReady && hvac_core_point_read_real(HVAC_POINT_RETURN_AIR, &h_ret);
 
     float h_heat_out = 0.0f, h_heat_req = 0.0f;
-    bool h_hout_ok = BacnetReady && read_real_property(OBJECT_ANALOG_VALUE, HEALTH_HEATING_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &h_heat_out);
-    bool h_hreq_ok = BacnetReady && read_real_property(OBJECT_ANALOG_VALUE, HEALTH_REQUIRED_HEATING_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &h_heat_req);
+    bool h_hout_ok = BacnetReady && hvac_core_point_read_real(HVAC_POINT_HEATING_OUTPUT, &h_heat_out);
+    bool h_hreq_ok = BacnetReady && hvac_core_point_read_real(HVAC_POINT_REQUIRED_HEATING_OUTPUT, &h_heat_req);
 
     const char *hmode = "cooling";
     if (h_hout_ok && h_hreq_ok && (h_heat_req > h_req || h_heat_out > h_out) && h_heat_req > 0.05f) {
@@ -4759,7 +4967,7 @@ static esp_err_t api_mqtt_entities_get_handler(httpd_req_t *req)
     /* Fan Health Entities */
     float fcnt_val = 0.0f;
     int fcnt = 2;
-    if (BacnetReady && read_real_property(OBJECT_ANALOG_VALUE, HEALTH_FAN_COUNT_INSTANCE, PROP_PRESENT_VALUE, &fcnt_val)) {
+    if (BacnetReady && hvac_core_point_read_real(HVAC_POINT_FAN_COUNT, &fcnt_val)) {
         fcnt = (int)(fcnt_val + 0.5f);
         if (fcnt < 1) fcnt = 1;
         if (fcnt > HEALTH_FAN_SUPPLY_AIR_COUNT) fcnt = HEALTH_FAN_SUPPLY_AIR_COUNT;
@@ -4975,6 +5183,27 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    /* Validate the point mapping before saving anything, so a bad entry
+       rejects the whole finish instead of leaving a half-saved setup. It is
+       absent when the controller could not be scanned, in which case the
+       current map stays in force. */
+    point_update_t *point_updates = NULL;
+    int point_count = 0;
+    if (strstr(body, "\"points\"")) {
+        char perr[96] = "out of memory";
+        point_updates = calloc(HVAC_POINT_COUNT, sizeof(point_update_t));
+        point_count = point_updates ? parse_points_json(body, point_updates, perr, sizeof(perr)) : -1;
+        if (point_count < 0) {
+            free(point_updates);
+            free(body);
+            char resp[200], esc[128];
+            json_escape(esc, perr, sizeof(esc));
+            snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"point mapping: %s\"}", esc);
+            send_bad_request(req, resp);
+            return ESP_OK;
+        }
+    }
+
     char tip[16] = {0};
     int tport = 0, tdev = 0;
     if (json_get_str(body, "target_ip", tip, sizeof(tip)) && strlen(tip) > 0) {
@@ -4995,6 +5224,14 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
 
     parse_rooms_from_json(body);
     rooms_config_save();
+
+    /* Point mapping confirmed in wizard step 3 (validated up front). */
+    if (point_updates) {
+        points_apply(point_updates);
+        free(point_updates);
+        bool pok = run_internal_flash_op(points_save_direct, NULL);
+        diag_log("wizard: %d points confirmed ok=%d", point_count, pok);
+    }
 
     char mhost[64] = {0}, muser[32] = {0}, mpass[64] = {0};
     char mtop[64] = {0}, mname[48] = {0}, mid[32] = {0};
@@ -5078,7 +5315,11 @@ static esp_err_t api_config_export_handler(httpd_req_t *req)
         nvs_close(whandle);
     }
 
-    char *buf = malloc(6144);
+    /* Sized with room for the point map below; PSRAM where available so a
+       backup download never competes with Wi-Fi/lwIP for internal heap. */
+    enum { EXPORT_BUF_LEN = 8192 };
+    char *buf = heap_caps_malloc(EXPORT_BUF_LEN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc(EXPORT_BUF_LEN);
     if (!buf) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -5101,7 +5342,7 @@ static esp_err_t api_config_export_handler(httpd_req_t *req)
     json_escape(mid_esc, HaDeviceId, sizeof(mid_esc));
 
     size_t off = snprintf(
-        buf, 6144,
+        buf, EXPORT_BUF_LEN,
         "{\n"
         "  \"version\": 1,\n"
         "  \"wizard_done\": %s,\n"
@@ -5127,7 +5368,7 @@ static esp_err_t api_config_export_handler(httpd_req_t *req)
         char rname_esc[64] = "";
         json_escape(rname_esc, Rooms[i].name, sizeof(rname_esc));
         off += snprintf(
-            buf + off, 6144 - off,
+            buf + off, EXPORT_BUF_LEN - off,
             "    {\"id\": %u, \"name\": \"%s\", \"active\": %s, "
             "\"setpoint_instance\": %u, \"temperature_instance\": %u, \"power_instance\": %u, "
             "\"supply_air_instance\": %u, \"required_output_instance\": %u, \"current_output_instance\": %u}%s\n",
@@ -5139,7 +5380,7 @@ static esp_err_t api_config_export_handler(httpd_req_t *req)
     }
 
     off += snprintf(
-        buf + off, 6144 - off,
+        buf + off, EXPORT_BUF_LEN - off,
         "  ],\n"
         "  \"mqtt\": {\n"
         "    \"host\": \"%s\",\n"
@@ -5164,7 +5405,7 @@ static esp_err_t api_config_export_handler(httpd_req_t *req)
         json_escape(pcomp_esc, CustomMqttPoints[i].component, sizeof(pcomp_esc));
         json_escape(ptstr_esc, CustomMqttPoints[i].type_str, sizeof(ptstr_esc));
         off += snprintf(
-            buf + off, 6144 - off,
+            buf + off, EXPORT_BUF_LEN - off,
             "    {\"type\": \"%s\", \"instance\": %u, \"name\": \"%s\", \"component\": \"%s\", \"enabled\": %s}%s\n",
             ptstr_esc, (unsigned)CustomMqttPoints[i].instance, pname_esc, pcomp_esc,
             CustomMqttPoints[i].enabled ? "true" : "false",
@@ -5172,13 +5413,41 @@ static esp_err_t api_config_export_handler(httpd_req_t *req)
     }
 
     off += snprintf(
-        buf + off, 6144 - off,
+        buf + off, EXPORT_BUF_LEN - off,
         "  ],\n"
+        "  \"points\": [\n");
+
+    /* Only installer decisions are exported; points still on the reference
+       map are omitted so a restore onto newer firmware keeps its defaults. */
+    bool first_point = true;
+    for (size_t i = 0; i < HVAC_POINT_COUNT && off < EXPORT_BUF_LEN - 256; i++) {
+        hvac_point_id_t id = (hvac_point_id_t)i;
+        hvac_point_source_t source = hvac_core_point_source(id);
+        if (source == HVAC_POINT_SOURCE_DEFAULT) continue;
+        uint16_t ptype = 0;
+        uint32_t pinst = 0;
+        if (hvac_core_point_get(id, &ptype, &pinst)) {
+            off += snprintf(buf + off, EXPORT_BUF_LEN - off,
+                "%s    {\"id\": \"%s\", \"mapped\": true, \"type\": \"%s\", \"instance\": %u}",
+                first_point ? "" : ",\n", hvac_core_point_def(id)->key,
+                bactext_object_type_name(ptype), (unsigned)pinst);
+        } else {
+            off += snprintf(buf + off, EXPORT_BUF_LEN - off,
+                "%s    {\"id\": \"%s\", \"mapped\": false}",
+                first_point ? "" : ",\n", hvac_core_point_def(id)->key);
+        }
+        first_point = false;
+    }
+
+    off += snprintf(
+        buf + off, EXPORT_BUF_LEN - off,
+        "%s  ],\n"
         "  \"app\": {\n"
         "    \"boost_timeout_min\": %u,\n"
         "    \"boost_revert_external\": %s\n"
         "  }\n"
         "}\n",
+        first_point ? "" : "\n",
         (unsigned)BoostTimeoutMinutes,
         BoostRevertExternal ? "true" : "false");
 
@@ -5306,6 +5575,21 @@ static esp_err_t api_config_import_handler(httpd_req_t *req)
     parse_custom_mqtt_from_json(body);
     custom_mqtt_save();
 
+    /* 6b. Whole-unit point map (optional; older backups have none, which
+       leaves the current map untouched). An invalid entry skips the whole
+       section rather than half-applying a map. */
+    if (strstr(body, "\"points\"")) {
+        point_update_t *updates = calloc(HVAC_POINT_COUNT, sizeof(point_update_t));
+        char perr[96] = {0};
+        if (updates && parse_points_json(body, updates, perr, sizeof(perr)) >= 0) {
+            points_apply(updates);
+            run_internal_flash_op(points_save_direct, NULL);
+        } else if (updates) {
+            diag_log("config import: points section ignored - %s", perr);
+        }
+        free(updates);
+    }
+
     /* 7. App / Boost settings */
     char app_obj[128] = {0};
     int b_min = 0;
@@ -5365,6 +5649,7 @@ static bool factory_reset_direct(void *arg)
     erase_namespace(NVS_CUSTOM_MQTT_NAMESPACE);
     erase_namespace(NVS_APP_NAMESPACE);
     erase_namespace(OTA_NVS_NAMESPACE);
+    hvac_core_points_erase();
     hvac_core_integration_reset();
     return true;
 }
@@ -5529,6 +5814,9 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &api_strategy_inspect_uri);
         httpd_register_uri_handler(server, &api_rooms_get_uri);
         httpd_register_uri_handler(server, &api_rooms_post_uri);
+        httpd_register_uri_handler(server, &api_points_get_uri);
+        httpd_register_uri_handler(server, &api_points_post_uri);
+        httpd_register_uri_handler(server, &points_js_uri);
         httpd_register_uri_handler(server, &api_integration_get_uri);
         httpd_register_uri_handler(server, &api_integration_post_uri);
         httpd_register_uri_handler(server, &api_matter_setup_get_uri);
@@ -5580,6 +5868,14 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &api_strategy_inspect_uri);
         httpd_register_uri_handler(server, &api_rooms_get_uri);
         httpd_register_uri_handler(server, &api_rooms_post_uri);
+        /* The wizard's point-mapping step scans the controller over
+           Ethernet, which is up in provisioning mode too. */
+        httpd_register_uri_handler(server, &api_objects_scan_start_uri);
+        httpd_register_uri_handler(server, &api_objects_scan_status_uri);
+        httpd_register_uri_handler(server, &api_objects_uri);
+        httpd_register_uri_handler(server, &api_points_get_uri);
+        httpd_register_uri_handler(server, &api_points_post_uri);
+        httpd_register_uri_handler(server, &points_js_uri);
         httpd_register_uri_handler(server, &api_integration_get_uri);
         httpd_register_uri_handler(server, &api_integration_post_uri);
         httpd_register_uri_handler(server, &api_matter_setup_get_uri);
@@ -5768,8 +6064,7 @@ static void mqtt_publish_discovery(void)
 
     /* Health Group Discovery */
     float disc_fan_count_raw = 0.0f;
-    bool disc_fan_count_valid = BacnetReady && read_real_property(
-        OBJECT_ANALOG_VALUE, HEALTH_FAN_COUNT_INSTANCE, PROP_PRESENT_VALUE, &disc_fan_count_raw);
+    bool disc_fan_count_valid = BacnetReady && hvac_core_point_read_real(HVAC_POINT_FAN_COUNT, &disc_fan_count_raw);
     int disc_fan_count = disc_fan_count_valid ? (int)(disc_fan_count_raw + 0.5f) : HEALTH_FAN_SPEED_COUNT;
     if (disc_fan_count < 0) disc_fan_count = 0;
     if (disc_fan_count > HEALTH_FAN_SPEED_COUNT) disc_fan_count = HEALTH_FAN_SPEED_COUNT;
@@ -5982,13 +6277,15 @@ static void mqtt_publish_boost_state(unsigned mode)
 
 static bool boost_apply(unsigned mode, bool self_initiated)
 {
-    if (!BacnetReady) {
+    /* Unmapped boost point: nothing to write, and no timer or MQTT state
+       should claim a boost that cannot exist on this controller. */
+    if (!BacnetReady || !hvac_core_point_get(HVAC_POINT_BOOST_MODE, NULL, NULL)) {
         return false;
     }
-    bool ok = write_msv_property(OBJECT_MULTI_STATE_VALUE, BOOST_INSTANCE, PROP_PRESENT_VALUE, mode);
+    bool ok = hvac_core_point_write_multistate(HVAC_POINT_BOOST_MODE, mode);
 
     unsigned actual = mode;
-    if (!read_msv_property(OBJECT_MULTI_STATE_VALUE, BOOST_INSTANCE, PROP_PRESENT_VALUE, &actual)) {
+    if (!hvac_core_point_read_multistate(HVAC_POINT_BOOST_MODE, &actual)) {
         actual = mode;
     }
     if (actual == BOOST_MODE_AUTO) {
@@ -6122,7 +6419,7 @@ static void mqtt_handle_command(const char *topic, const char *data)
         }
         unsigned actual;
         if (BacnetReady &&
-            read_msv_property(OBJECT_MULTI_STATE_VALUE, BOOST_INSTANCE, PROP_PRESENT_VALUE, &actual)) {
+            hvac_core_point_read_multistate(HVAC_POINT_BOOST_MODE, &actual)) {
             mqtt_publish_boost_state(actual);
         }
         return;
@@ -6427,8 +6724,7 @@ static void mqtt_state_task(void *arg)
             }
 
             unsigned boost_mode;
-            if (read_msv_property(
-                    OBJECT_MULTI_STATE_VALUE, BOOST_INSTANCE, PROP_PRESENT_VALUE, &boost_mode)) {
+            if (hvac_core_point_read_multistate(HVAC_POINT_BOOST_MODE, &boost_mode)) {
                 if (boost_mode == BOOST_MODE_AUTO) {
                     BoostSelfInitiated = false;
                     BoostDeadlineUs = 0;
@@ -6533,14 +6829,14 @@ static void mqtt_state_task(void *arg)
 
             if (HaHealthDiscoveryEnabled) {
                 float h_out = 0.0f, h_req = 0.0f, h_fp = 0.0f, h_ret = 0.0f;
-                bool h_out_ok = read_real_property(OBJECT_ANALOG_VALUE, HEALTH_COOLING_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &h_out);
-                bool h_req_ok = read_real_property(OBJECT_ANALOG_VALUE, HEALTH_REQUIRED_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &h_req);
-                bool h_fp_ok = read_real_property(OBJECT_ANALOG_VALUE, HEALTH_FLOW_DESIGN_PCT_INSTANCE, PROP_PRESENT_VALUE, &h_fp);
-                bool h_ret_ok = read_real_property(OBJECT_ANALOG_INPUT, HEALTH_RETURN_AIR_INSTANCE, PROP_PRESENT_VALUE, &h_ret);
+                bool h_out_ok = hvac_core_point_read_real(HVAC_POINT_COOLING_OUTPUT, &h_out);
+                bool h_req_ok = hvac_core_point_read_real(HVAC_POINT_REQUIRED_COOLING_OUTPUT, &h_req);
+                bool h_fp_ok = hvac_core_point_read_real(HVAC_POINT_COOLING_FLOW_DESIGN_PCT, &h_fp);
+                bool h_ret_ok = hvac_core_point_read_real(HVAC_POINT_RETURN_AIR, &h_ret);
 
                 float h_hout = 0.0f, h_hreq = 0.0f;
-                bool h_hout_ok = read_real_property(OBJECT_ANALOG_VALUE, HEALTH_HEATING_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &h_hout);
-                bool h_hreq_ok = read_real_property(OBJECT_ANALOG_VALUE, HEALTH_REQUIRED_HEATING_OUTPUT_INSTANCE, PROP_PRESENT_VALUE, &h_hreq);
+                bool h_hout_ok = hvac_core_point_read_real(HVAC_POINT_HEATING_OUTPUT, &h_hout);
+                bool h_hreq_ok = hvac_core_point_read_real(HVAC_POINT_REQUIRED_HEATING_OUTPUT, &h_hreq);
 
                 bool is_heating = (h_hout_ok && h_hreq_ok && (h_hreq > h_req || h_hout > h_out) && h_hreq > 0.05f);
                 float cur_out = is_heating ? (h_hout_ok ? h_hout : 0.0f) : (h_out_ok ? h_out : 0.0f);
@@ -6595,7 +6891,7 @@ static void mqtt_state_task(void *arg)
                 /* Fan health states */
                 float fcnt_val = 0.0f;
                 int fcnt = 2;
-                if (read_real_property(OBJECT_ANALOG_VALUE, HEALTH_FAN_COUNT_INSTANCE, PROP_PRESENT_VALUE, &fcnt_val)) {
+                if (hvac_core_point_read_real(HVAC_POINT_FAN_COUNT, &fcnt_val)) {
                     fcnt = (int)(fcnt_val + 0.5f);
                     if (fcnt < 1) fcnt = 1;
                     if (fcnt > HEALTH_FAN_SUPPLY_AIR_COUNT) fcnt = HEALTH_FAN_SUPPLY_AIR_COUNT;
@@ -6741,6 +7037,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     target_config_load();
     rooms_config_load();
+    hvac_core_points_load();
     hvac_core_integration_load();
     mqtt_config_load();
     custom_mqtt_load();

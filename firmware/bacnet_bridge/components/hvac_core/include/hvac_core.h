@@ -12,8 +12,6 @@ extern "C" {
 /* Protocol-neutral room mapping. Integrations own neither this data nor its NVS schema. */
 #define HVAC_CORE_MAX_ROOMS 8
 
-#define SYS_POWER_WRITE_INSTANCE 13
-#define SYS_POWER_READBACK_INSTANCE 1
 #define MIN_SETPOINT_C 18.0f
 #define MAX_SETPOINT_C 30.0f
 
@@ -63,6 +61,95 @@ void hvac_core_integration_reset(void);
  * "you need to retry pairing" signal. Loaded once alongside the mode. */
 hvac_pairing_status_t hvac_core_matter_pairing_get(void);
 bool hvac_core_matter_pairing_set(hvac_pairing_status_t status);
+
+/* Whole-unit controller points (system power, boost, health diagnostics).
+ * hvac_core is the single owner of these object references: nothing else
+ * may hardcode their instance numbers. Each install maps them once (setup
+ * wizard or Objects page: scan -> name match -> confirm) and the result is
+ * persisted to NVS. With no stored mapping the reference Delta DAC-1180E
+ * program's verified point map applies, so existing installs keep working
+ * unchanged across the upgrade. */
+typedef enum {
+    HVAC_POINT_SYS_POWER_WRITE = 0,
+    HVAC_POINT_SYS_POWER_READBACK,
+    HVAC_POINT_BOOST_MODE,
+    HVAC_POINT_DESIGN_COOLING_DUTY,
+    HVAC_POINT_COOLING_OUTPUT,
+    HVAC_POINT_REQUIRED_COOLING_OUTPUT,
+    HVAC_POINT_COOLING_FLOW,
+    HVAC_POINT_REQUIRED_COOLING_FLOW,
+    HVAC_POINT_COOLING_FLOW_DESIGN_PCT,
+    HVAC_POINT_COOLING_VALVE_SIGNAL,
+    HVAC_POINT_DESIGN_HEATING_DUTY,
+    HVAC_POINT_HEATING_OUTPUT,
+    HVAC_POINT_REQUIRED_HEATING_OUTPUT,
+    HVAC_POINT_HEATING_FLOW,
+    HVAC_POINT_REQUIRED_HEATING_FLOW,
+    HVAC_POINT_HEATING_FLOW_DESIGN_PCT,
+    HVAC_POINT_HEATING_VALVE_SIGNAL,
+    HVAC_POINT_RETURN_AIR,
+    HVAC_POINT_FAN_COUNT,
+    HVAC_POINT_COOLING_VALVE_STATUS,
+    HVAC_POINT_HEATING_VALVE_STATUS,
+    HVAC_POINT_COUNT
+} hvac_point_id_t;
+
+/* What the firmware does with the value - decides which object types are
+ * compatible with the point (a real can come from AI/AO/AV, and so on). */
+typedef enum {
+    HVAC_POINT_KIND_REAL = 0,
+    HVAC_POINT_KIND_BOOL,
+    HVAC_POINT_KIND_MULTISTATE,
+} hvac_point_kind_t;
+
+typedef enum {
+    HVAC_POINT_SOURCE_DEFAULT = 0, /* reference map, never confirmed on this install */
+    HVAC_POINT_SOURCE_CONFIRMED,   /* chosen and saved by the installer */
+    HVAC_POINT_SOURCE_UNMAPPED,    /* installer confirmed this controller has no such point */
+} hvac_point_source_t;
+
+/* Static description of one point. Lives in flash (.rodata); the patterns
+ * are case-insensitive regular expressions evaluated by the browser against
+ * the scanned object names, so the device never runs a regex engine. */
+typedef struct {
+    const char *key;            /* NVS key and API id (<= 15 chars) */
+    const char *label;          /* installer-facing name */
+    const char *group;          /* "control" or "health" */
+    const char *description;    /* what it is used for */
+    const char *reference_name; /* object name on the reference controller */
+    const char *pattern;        /* name-match regex */
+    hvac_point_kind_t kind;
+    bool writable;              /* firmware writes to it */
+    uint16_t default_type;      /* BACNET_OBJECT_TYPE on the reference controller */
+    uint32_t default_instance;
+} hvac_point_def_t;
+
+const hvac_point_def_t *hvac_core_point_def(hvac_point_id_t id);
+/* Binding currently in force; false when the point is unmapped. */
+bool hvac_core_point_get(hvac_point_id_t id, uint16_t *out_type, uint32_t *out_instance);
+hvac_point_source_t hvac_core_point_source(hvac_point_id_t id);
+/* Whether an object type can carry this point's value (and be written, if
+ * the point is written). */
+bool hvac_core_point_type_ok(hvac_point_id_t id, uint16_t type);
+/* Stage a binding in RAM. mapped=false records "not present on this
+ * controller". Returns false on an incompatible type or bad instance. */
+bool hvac_core_point_set(hvac_point_id_t id, bool mapped, uint16_t type, uint32_t instance);
+/* Reference map, discarding any confirmed bindings (RAM only). */
+void hvac_core_points_reset(void);
+void hvac_core_points_load(void);
+/* Persists the whole map; must run on an internal-RAM stack (flash write). */
+bool hvac_core_points_save(void);
+/* NVS erase of the stored map; same stack rule as save. */
+void hvac_core_points_erase(void);
+
+/* Typed access through the map. Every one returns false for an unmapped
+ * point without touching the network, so callers' existing invalid-value
+ * paths cover "this controller has no such point". */
+bool hvac_core_point_read_real(hvac_point_id_t id, float *out_val);
+bool hvac_core_point_read_bool(hvac_point_id_t id, bool *out_val);
+bool hvac_core_point_read_multistate(hvac_point_id_t id, unsigned *out_val);
+bool hvac_core_point_write_bool(hvac_point_id_t id, bool val);
+bool hvac_core_point_write_multistate(hvac_point_id_t id, unsigned val);
 
 /* Protocol-neutral semantic HVAC operations (Single Source of Truth) */
 hvac_room_config_t *hvac_core_get_room(size_t room_idx);

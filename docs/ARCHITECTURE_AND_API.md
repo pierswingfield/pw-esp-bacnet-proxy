@@ -87,11 +87,22 @@ static address.
   SPI interface or the T-ETH-Lite integrated RTL8201 PHY, selected by the
   build profile.
 - **`components/dns_server`**: Captive portal DNS redirect server for initial WiFi provisioning.
+- **`components/hvac_core`**: Protocol-neutral room model and the single owner
+  of the whole-unit point map (system power, Boost, Health). Nothing else
+  hardcodes those instance numbers; callers use `hvac_core_point_read_*` /
+  `hvac_core_point_write_*`, which return false for an unmapped point. The
+  definitions table lives in flash; the live map (105 B) is in PSRAM on the
+  Matter build.
 
 ### Non-Volatile Storage (NVS) Schema
 State is saved across reboots using ESP-IDF NVS namespaces:
 - `nvs_target`: `ip` (string), `port` (uint16), `dev_id` (uint32).
 - `nvs_rooms`: `count` (uint8), `r{i}_name`, `r{i}_en`, `r{i}_sp`, `r{i}_temp`, `r{i}_pwr`, `r{i}_sup`, `r{i}_req`, `r{i}_cur`.
+- `nvs_points`: one `uint32` per confirmed whole-unit point, keyed by point id
+  (`sys_pwr_cmd`, `sys_pwr_fb`, `boost_mode`, `cool_design`, ... - see
+  `PointDefs` in `hvac_core.c`). The value is the BACnet object identifier
+  (`type << 22 | instance`); `0xFFFFFFFF` records "not present on this
+  controller". A missing key means the reference default applies.
 - `nvs_mqtt`: `host`, `port`, `user`, `pass`, `prefix`.
 - `nvs_ota`: `password` (string).
 - `nvs_wifi`: `ssid`, `password`.
@@ -203,6 +214,11 @@ Returns general climate system state, boost timers, and per-room statuses.
     ]
   }
   ```
+  Object references below are the reference defaults; each install's
+  confirmed point map (see `/api/points`) decides the actual objects.
+  `sys_power_mapped`/`boost_mapped` are false when the installer confirmed the
+  controller has no such point (the matching control then always fails), and
+  `points_confirmed` says whether a map was ever confirmed on this install.
   `sys_power`/`sys_power_valid` is the raw `FCU Run Status` readback
   (`binary-value:1`) — "is anything actually running," which can legitimately
   diverge from what was commanded (a wall panel or PIR can hold the unit
@@ -314,8 +330,24 @@ persists the choice. Send `value=on` or `value=off` as form data. It is off by
 default; enabling it advertises `esp-bacnet-bridge.local`. This does not
 disable the wizard's temporary MQTT-broker discovery query.
 
+#### `GET /api/points`
+Lists the 21 whole-unit points with their label, group (`control` or
+`health`), name-match `pattern` (case-insensitive regex), `reference_name`,
+compatible object `types`, `default` binding, and current binding (`source`:
+`default`, `confirmed` or `unmapped`; `mapped`, `type`, `instance`). The
+wizard and Objects page (`/points.js`) match these patterns against the
+`/api/objects` scan catalogue in the browser; the device never runs a regex.
+
+#### `POST /api/points`
+Body `{"points":[{"id":"sys_pwr_cmd","mapped":true,"type":"binary-value","instance":13},{"id":"heat_vlv_state","mapped":false}]}`.
+Validated as a whole (unknown id, bad instance or incompatible type rejects
+the request with nothing applied), then persisted to `nvs_points`. Points not
+listed are unchanged. `{"reset":true}` returns every point to the reference
+default. `POST /api/wizard/finish` accepts the same `points` array.
+
 #### `GET /api/config/export`
-Exports complete NVS configuration (WiFi, Target IP, Rooms, MQTT) as a downloadable JSON object.
+Exports complete NVS configuration (WiFi, Target IP, Rooms, MQTT, confirmed
+point map) as a downloadable JSON object.
 
 #### `POST /api/config/import`
 Restores device configuration from an uploaded JSON payload.

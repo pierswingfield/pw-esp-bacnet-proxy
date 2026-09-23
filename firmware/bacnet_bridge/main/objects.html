@@ -115,6 +115,7 @@
       .card { border:1px solid #e5e7eb; border-radius:6px; padding:0.7em 0.85em; margin-top:0.45em; background:#fff; }
     </style>
     <title>Objects - ESP32 BACnet Bridge</title>
+    <script src="/points.js"></script>
   </head>
   <body>
     <nav class="topnav">
@@ -142,6 +143,14 @@
       <strong id="hiddenCount">0</strong> hidden as not-configured or duplicated &mdash; listed with reasons at the
       bottom of each section. Points are never hidden for reading zero; a freshness marker shows when each one last
       moved, as of the last full discovery scan.</p>
+
+    <details id="pointMapSection" class="card" style="margin-top:0.8em;">
+      <summary style="cursor:pointer; font-weight:bold; color:#06c;">Controller point mapping &mdash; system power, Boost &amp; Health diagnostics</summary>
+      <p class="note" style="margin-top:0.5em;">Which of this controller's objects the bridge uses for the whole-unit
+        on/off switch, Boost, and the Health page. Matched by object name from a scan; nothing changes until you
+        confirm and save.</p>
+      <div id="pointMapper"></div>
+    </details>
 
     <div class="toolbar">
       <button type="button" class="primary" id="scanBtn">Rescan Controller</button>
@@ -225,6 +234,19 @@
       units and freshness markers come from the last full discovery scan taken during development (13 Aug 2026);
       present values and priority arrays shown in an expanded row are read live from the panel.</p>
 
+    <script>
+      /* Point mapping: loaded only when the section is opened, so browsing
+         the catalogue never triggers a second scan. */
+      (function () {
+        var section = document.getElementById('pointMapSection');
+        var mapper = null;
+        section.addEventListener('toggle', function () {
+          if (!section.open || mapper || typeof PointMapper === 'undefined') return;
+          mapper = new PointMapper(document.getElementById('pointMapper'), { showSave: true, expanded: true });
+          mapper.start();
+        });
+      })();
+    </script>
     <script>
       /* ======================================================================
          STATIC METADATA — units and last-changed markers are physically fixed
