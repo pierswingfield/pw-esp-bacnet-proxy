@@ -1,5 +1,58 @@
 # Backlog
 
+## Hardcoded-assumption sweep (2026-09-23)
+
+Prompted by finding the room-config truncation bug while stress-testing
+Matter at 6 rooms: swept for other places where a specific-install
+assumption or fixed limit isn't actually configurable per the project's
+own protocol-agnostic, scalable-by-design intent. Three silent-truncation
+bugs of the same shape (object scan, custom MQTT points, BACnet discovery)
+were found and fixed directly. The items below are real but are design
+decisions, not one-line fixes - listed here rather than changed blind.
+
+- **BACnet discovery is hardcoded to a `10.0.3.x` unicast scan range**:
+  `execute_worker_discovery()` in `bacnet_worker.c` explicitly unicasts
+  Who-Is to `10.0.3.1` through `10.0.3.32` (plus broadcasts to
+  `10.0.3.255` and the BACnet/IP broadcast address), in addition to
+  sending a global Who-Is. On an isolated segment numbered differently
+  than the documented `10.0.3.x` convention (see root `CLAUDE.md`),
+  discovery would rely on the broadcast path alone rather than genuinely
+  scan the actual configured subnet - the unicast sweep gives it a much
+  higher hit rate on the convention this project has always used, but
+  wouldn't adapt to a different one.
+- **The bridge's own static IP is compiled in**: `LOCAL_STATIC_IP
+  "10.0.3.99"` in `main.c` has no settings-page override; changing it
+  needs a firmware rebuild. This one may be intentional - root
+  `CLAUDE.md` documents "both profiles use the same static address" on
+  the isolated segment - but it's worth naming explicitly as a real
+  hardcode either way, so a future decision to make it configurable
+  (or to keep it fixed on purpose) is made deliberately, not by omission.
+- **System power/boost/health object instance numbers are hardcoded to
+  this specific Delta DAC-1180E's program**: `SYS_POWER_WRITE_INSTANCE`,
+  `SYS_POWER_READBACK_INSTANCE`, `BOOST_INSTANCE`, and the full
+  `HEALTH_*_INSTANCE` set (~18 macros) in `main.c` are fixed constants
+  tied to this one controller's verified point map ("confirmed via Phase
+  0.5 diff"). Unlike room setpoint/temperature/power instances - which
+  *are* per-install configurable via `rooms.json` - there is no UI or
+  config path to remap these for a different Delta unit's programming, a
+  different FCU controller model, or a different vendor's BACnet device
+  entirely. Anyone deploying this against different controller logic
+  needs a firmware rebuild, not a settings change.
+- **`HVAC_CORE_MAX_ROOMS` (8) and `CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT`
+  (16) are two independent constants that must be kept in sync by hand**:
+  at 8 rooms the Matter side needs aggregator(1) + system(1) + boost(2) +
+  rooms(8) = 12 of the 16 available dynamic endpoints. Raising
+  `HVAC_CORE_MAX_ROOMS` alone in the future (e.g. to 12, for a larger
+  home) would silently exceed the Matter endpoint budget at 16 rooms'
+  worth of config without any build-time check tying the two together -
+  worth a `static_assert` or Kconfig cross-check rather than relying on
+  whoever changes one constant remembering to check the other.
+- **mDNS hostname is a single fixed string** (`MDNS_HOSTNAME
+  "esp-bacnet-bridge"`, `main.c`): fine for one bridge per network (the
+  expected deployment), but two bridges on the same LAN would collide.
+  Low priority given the product's actual use pattern, noted for
+  completeness.
+
 ## Automatic updates
 
 - Scheduled background check of the T-ETH-Lite release manifest, plus a
