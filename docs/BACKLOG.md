@@ -1,17 +1,21 @@
 # Backlog
 
-## HTTP "Connection reset by peer" under sustained polling - root-caused (2026-09-23)
+## HTTP "Connection reset by peer" - time-driven, likely Matter CASE-resumption retry (2026-09-23)
 
 Open since 2026-09-12 ("one open HTTP-reset bug not yet root-caused" -
 ping stays healthy at 7-8ms, HTTP stops accepting new connections,
-confirmed persistent/non-self-resolving at the time). Root-caused live by
-a second Claude session working in parallel tonight, reproduced reliably
-via the object scan's status-polling (`/api/objects/scan-status` every
-~4s) — died at t=38s/55% through a scan with `httpd_accept_conn: error in
-accept (23)` on serial (errno 23 = ENFILE, system-wide socket table
-exhausted).
+confirmed persistent/non-self-resolving at the time). Investigated live
+tonight by two Claude sessions working in parallel; the TIME_WAIT theory
+below was proposed, tested, and **falsified** - recorded here so the
+disproven path isn't retrodden.
 
-Eliminated as causes (each independently confirmed, not assumed):
+First reproduction: object scan's status-polling
+(`/api/objects/scan-status` every ~4s) died at t=38s/55% through a scan
+with `httpd_accept_conn: error in accept (23)` on serial (errno 23 =
+ENFILE, system-wide socket table exhausted).
+
+Eliminated as causes (each independently confirmed by reading the actual
+code, not assumed):
 - **BACnet's own networking**: `bip_init()` opens exactly one UDP socket
   once at worker startup; the scan dispatches through the existing
   worker queue and never calls `socket()` itself.
@@ -23,36 +27,48 @@ Eliminated as causes (each independently confirmed, not assumed):
   `mdns_start_service()`), not a factor unless a user opts in; its
   create/delete socket pairing in `mdns_networking_socket.c` also looks
   correctly guarded on every path checked.
-- **Matter's entire networking stack**: `UDPEndPointImplLwIP.cpp`
+- **Matter's entire networking stack, checked twice**: `UDPEndPointImplLwIP.cpp`
   (connectedhomeip `src/inet/`) uses raw lwIP PCBs (`udp_new`/`struct
   udp_pcb`), never calls `socket()`. Matter's own minimal-mDNS
-  advertisement (`src/lib/dnssd/minimal_mdns/Server.cpp`, the
-  `_matterc._udp`/`_matter._tcp` advertisement) delegates to the same
-  `chip::Inet::UDPEndPoint` - same conclusion. Neither Matter's main
-  protocol traffic nor its own discovery touches the BSD-socket/fd table
-  ENFILE exhausted, structurally.
+  advertisement (`src/lib/dnssd/minimal_mdns/Server.cpp`) and the CASE
+  session-establishment call chain
+  (`CASESessionManager::FindOrEstablishSession` ->
+  `FindOrEstablishSessionHelper`) both bottom out on the same
+  `chip::Inet::UDPEndPoint`. Espressif's own esp-matter components
+  (not just vanilla connectedhomeip) were also grepped for any
+  ESP32-specific `socket()` override - none found. No BSD-socket-touching
+  point could be found anywhere in Matter's networking or session/
+  subscription-resumption code by static reading.
 
-**Likely actual cause**: not a leak anywhere in this codebase. Both httpd
-instances have `lru_purge_enable=true` (main.c ~5622/~5734), so httpd's
-own 8-socket pool never overflows - it evicts its own least-recently-used
-connection to make room. But that only updates httpd's internal
-bookkeeping; the underlying closed TCP socket still enters `TIME_WAIT` at
-the lwIP/OS level independently, and lingers there regardless (standard
-~30-60s). At ~4s polling, overlapping `TIME_WAIT` entries accumulate in
-the shared `CONFIG_LWIP_MAX_SOCKETS=16` system-wide table faster than
-they expire, stacking on BACnet's 1 permanently-open socket, until
-`accept()` itself fails with ENFILE regardless of what httpd's own pool
-thinks it has room for. Timing fits: ~38s at ~4s/poll is roughly the
-point enough overlapping `TIME_WAIT` sockets would pile up.
+**Disproven**: a TIME_WAIT-accumulation theory (fast HTTP polling
+outliving httpd's `lru_purge_enable`d 8-socket pool at the lwIP level,
+exhausting the shared 16-socket table). **Falsified by direct experiment**:
+slowing the poll interval 5x (1.2s -> 5s) did not meaningfully delay the
+failure (both still failed within ~5s of each other in wall-clock uptime:
+~62.7s vs ~67.6s), and the same boot hit a **second, unprompted ENFILE at
+up=267s with zero HTTP polling happening in between** - it recurred on its
+own. A request-volume-driven theory cannot explain either result.
 
-**Fix options, cheapest to most involved**: slow the scan-status poll
-interval; raise `CONFIG_LWIP_MAX_SOCKETS` for headroom (buys more time
-before tripping, doesn't fix the underlying pattern); move scan-status
-polling to a persistent connection (WebSocket/SSE) instead of repeated
-short-lived GETs, which would eliminate the `TIME_WAIT` churn entirely -
-this is the only option among the three that actually removes the root
-cause rather than pushing the ceiling further out. Given the object scan
-already needs a progress-indicator UX pass, worth doing both together.
+**Current strongest lead**: something schedule-driven since boot, not
+traffic-driven. The one thing on that schedule in serial on every
+reproduction so far: `chip[IN]: SendMessage() ... failed: 3000004` /
+`chip[DMG]: Failed to establish CASE for subscription-resumption with
+error '3000004'` at ~5-14s uptime.
+`SubscriptionResumptionSessionEstablisher::HandleDeviceConnectionFailure`
+(connectedhomeip `src/app/SubscriptionResumptionSessionEstablisher.cpp`)
+retries via `InteractionModelEngine::TryToResumeSubscriptions()` with
+Fibonacci backoff on failure - a real retry-compounds-on-failure shape -
+but tracing where that retry actually allocates a resource still leads
+back to the same raw-PCB transport already ruled out above, so the exact
+leaked resource (if it's a leak in this codebase at all, rather than a
+Matter-stack-internal pool exhaustion with a secondary effect on httpd)
+remains unidentified.
+
+**Next step, since static reading is exhausted**: dynamic instrumentation
+- log open socket/fd count (or free entries in
+`CONFIG_LWIP_MAX_SOCKETS`) alongside uptime across a boot, correlated
+against the CASE-resumption retry log lines, to catch the actual resource
+being consumed rather than inferring it from source.
 
 ## Hardcoded-assumption sweep (2026-09-23)
 
