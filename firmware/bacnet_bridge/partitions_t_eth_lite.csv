@@ -1,0 +1,11 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# 16MB Partition Table for LILYGO T-ETH-Lite (ESP32-WROVER-E 16MB Flash, 8MB PSRAM)
+# Enlarged dual 4MB OTA slots for Matter-over-Wi-Fi image support with ample headroom,
+# expanded 64K NVS for Matter fabrics/credentials, 24K matter_fctry, and 128K coredump.
+nvs,          data, nvs,      0x9000,   0x10000,
+otadata,      data, ota,      0x19000,  0x2000,
+phy_init,     data, phy,      0x1b000,  0x1000,
+matter_fctry, data, 0x99,     0x1c000,  0x6000,
+ota_0,        app,  ota_0,    0x30000,  4096K,
+ota_1,        app,  ota_1,    0x430000, 4096K,
+coredump,     data, coredump, 0x830000, 128K,

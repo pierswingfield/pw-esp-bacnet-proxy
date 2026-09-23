@@ -51,8 +51,9 @@ idf_component_register(
     "bacnet/whohas.c"
     "bacnet/whois.c"
     "bacnet/wp.c"
+    "bacnet_worker.c"
     INCLUDE_DIRS "."
-    REQUIRES esp_netif lwip
+    REQUIRES esp_netif lwip esp_timer
 )
 
 # Match the flags this codebase (and the validated ESP32 port) expects.

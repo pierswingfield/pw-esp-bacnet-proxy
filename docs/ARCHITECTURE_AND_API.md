@@ -332,6 +332,8 @@ published changelog and release download when a newer compatible image exists.
 
 ## Out of scope
 
-Native HomeKit, Matter/Google Home and Alexa integrations are not committed
-roadmap items for this firmware. Home Assistant via MQTT remains the supported
-automation integration.
+Native Matter integration is an active design/refactor on
+`codex/protocol-agnostic-core`, but is not yet a supported firmware feature.
+Home Assistant via MQTT remains the supported automation integration. The
+decision record and implementation gates are in
+[`MATTER_INTEGRATION_ASSESSMENT_AND_PLAN.md`](MATTER_INTEGRATION_ASSESSMENT_AND_PLAN.md).

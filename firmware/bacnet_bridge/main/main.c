@@ -55,6 +55,7 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "esp_netif.h"
+#include "esp_attr.h"
 #include "esp_eth.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -64,6 +65,8 @@
 #include "esp_random.h"
 #include "esp_heap_caps.h"
 #include "ethernet_init.h"
+#include "hvac_core.h"
+#include "matter_adapter.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -97,24 +100,11 @@
 #endif
 
 #include "bacnet/bacdef.h"
-#include "bacnet/bacaddr.h"
 #include "bacnet/bacapp.h"
 #include "bacnet/bacenum.h"
-#include "bacnet/npdu.h"
-#include "bacnet/apdu.h"
-#include "bacnet/rp.h"
-#include "bacnet/wp.h"
 #include "bacnet/bactext.h"
-#include "bacnet/basic/binding/address.h"
-#include "bacnet/basic/tsm/tsm.h"
-#include "bacnet/basic/service/s_rp.h"
-#include "bacnet/basic/service/s_wp.h"
-#include "bacnet/basic/service/h_apdu.h"
-#include "bacnet/basic/npdu/h_npdu.h"
-#include "bacnet/datalink/bip.h"
-#include "bacnet/iam.h"
-#include "bacnet/whois.h"
-#include "bacnet/basic/service/s_whois.h"
+#include "bacnet_worker.h"
+#include "hvac_core.h"
 
 /* Forward declared here (before every call site) so it's usable from
    anywhere in the file regardless of definition order. Ships a line to the
@@ -133,6 +123,11 @@ static void mqtt_resume_after_link_up(void);
    state and /api/device/mdns sets it, both of which appear well before the
    mDNS helpers themselves. Off by default - see NVS_KEY_MDNS_ENABLED. */
 #define MDNS_HOSTNAME "esp-bacnet-bridge"
+/* The actually-active hostname: MDNS_HOSTNAME until mdns_start_service()
+ * finds that name already taken on the LAN, at which point it becomes
+ * MDNS_HOSTNAME-1, -2, etc. Two bridges on one network should still both
+ * get a working .local name instead of colliding on the fixed default. */
+static EXT_RAM_BSS_ATTR char MdnsHostname[40];
 static bool MdnsEnabled = false;
 static bool MdnsRunning = false;
 static void mdns_apply_setting(void);
@@ -210,6 +205,53 @@ static bool spawn_task(
     return false;
 }
 
+/* Connected-mode HTTPD deliberately uses a PSRAM stack for its large BACnet
+ * handlers. Flash cache is disabled during NVS and OTA writes, so those writes
+ * must never run on that task. Submit short persistence operations here; they
+ * execute synchronously on a temporary internal-RAM stack and propagate their
+ * result back to the caller. */
+typedef bool (*internal_flash_op_t)(void *arg);
+typedef struct {
+    internal_flash_op_t op;
+    void *arg;
+    SemaphoreHandle_t finished;
+    bool ok;
+} internal_flash_request_t;
+
+static void internal_flash_worker(void *arg)
+{
+    internal_flash_request_t *request = (internal_flash_request_t *)arg;
+    request->ok = request->op(request->arg);
+    xSemaphoreGive(request->finished);
+    vTaskDelete(NULL);
+}
+
+static bool run_internal_flash_op(internal_flash_op_t op, void *arg)
+{
+    internal_flash_request_t *request = heap_caps_calloc(
+        1, sizeof(*request), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!request) return false;
+    request->finished = xSemaphoreCreateBinary();
+    if (!request->finished) {
+        heap_caps_free(request);
+        return false;
+    }
+    request->op = op;
+    request->arg = arg;
+    if (xTaskCreatePinnedToCore(internal_flash_worker, "flash_store", 4096,
+                                request, 6, NULL, 0) != pdPASS) {
+        vSemaphoreDelete(request->finished);
+        heap_caps_free(request);
+        ESP_LOGE("MAIN", "internal flash worker could not start");
+        return false;
+    }
+    xSemaphoreTake(request->finished, portMAX_DELAY);
+    bool ok = request->ok;
+    vSemaphoreDelete(request->finished);
+    heap_caps_free(request);
+    return ok;
+}
+
 /* ===================== In-Memory Web Log Buffer ===================== */
 /* Halved from 16384 on 2026-08-25. This is a plain static ring buffer for
    /api/logs; 8K still holds a useful scrollback and returns 8K of DRAM to a
@@ -275,7 +317,12 @@ static bool BoostSelfInitiated = false;
 static int64_t BoostDeadlineUs = 0;
 
 static bool boost_apply(unsigned mode, bool self_initiated);
-static void app_config_save(void);
+static bool app_config_save(void);
+
+static bool matter_system_power_write(bool on);
+static bool matter_system_power_read(bool *out_on);
+static bool matter_boost_write(matter_boost_target_t target, bool on);
+static bool matter_boost_read(matter_system_mode_t *out_mode);
 
 static int boost_remaining_minutes(void)
 {
@@ -291,29 +338,16 @@ static int boost_remaining_minutes(void)
 
 #define MIN_SETPOINT_C 18.0f
 
-typedef struct {
-    char name[32];
-    bool active;
-    uint32_t setpoint_instance;    /* analog-value, `Room_x Setpoint` */
-    uint32_t temperature_instance; /* analog-value, `Room_x Temperature`, read-only */
-    uint32_t power_instance;       /* binary-value, `Room_x Run Status` */
-    uint32_t supply_air_instance;    /* analog-value, `Room_x Supply Air Temperature`, read-only */
-    uint32_t required_output_instance; /* analog-value, `Room_x Required Thermal Output` (kW), read-only */
-    uint32_t current_output_instance;  /* analog-value, `Room_x Current Thermal Output` (kW), read-only */
-} room_config_t;
-
-#define MAX_ROOMS 8
-static room_config_t Rooms[MAX_ROOMS] = {
-    { "Room A", true, 1100, 1101, 1101, 1102, 1105, 1106 },
-    { "Room B", true, 1200, 1201, 1201, 1202, 1205, 1206 },
-    { "Room C", false, 1300, 1301, 1301, 1302, 1305, 1306 },
-    { "Room D", false, 1400, 1401, 1401, 1402, 1405, 1406 },
-    { "Room E", false, 1500, 1501, 1501, 1502, 1505, 1506 },
-};
-static size_t RoomCount = 5;
+typedef hvac_room_config_t room_config_t;
+#define MAX_ROOMS HVAC_CORE_MAX_ROOMS
+#define Rooms HvacRooms
+#define RoomCount HvacRoomCount
 
 #define NVS_TARGET_NAMESPACE "nvs_target"
 #define NVS_ROOMS_NAMESPACE "nvs_rooms"
+
+static char TargetDeviceName[MAX_CHARACTER_STRING_BYTES + 1] = {0};
+static volatile bool TargetDeviceNameValid = false;
 
 static void target_config_load(void)
 {
@@ -325,127 +359,97 @@ static void target_config_load(void)
     nvs_get_str(handle, "ip", TargetIp, &ip_len);
     nvs_get_u16(handle, "port", &TargetPort);
     nvs_get_u32(handle, "dev_id", &TargetDeviceInstance);
+    /* Discovery confirms the target's self-reported name once, interactively
+     * (see api_bacnet_discover_handler); without persisting it, the status
+     * page reverted to "Not confirmed yet" on every reboot even though the
+     * target itself (ip/port/dev_id above) was correctly configured and
+     * responding the whole time. */
+    size_t name_len = sizeof(TargetDeviceName);
+    if (nvs_get_str(handle, "name", TargetDeviceName, &name_len) == ESP_OK && TargetDeviceName[0] != '\0') {
+        TargetDeviceNameValid = true;
+    }
     nvs_close(handle);
+    bacnet_worker_set_target(TargetDeviceInstance, TargetIp, TargetPort);
 }
 
-static void target_config_save(void)
+static bool target_config_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_TARGET_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
-    nvs_set_str(handle, "ip", TargetIp);
-    nvs_set_u16(handle, "port", TargetPort);
-    nvs_set_u32(handle, "dev_id", TargetDeviceInstance);
-    nvs_commit(handle);
+    esp_err_t err = nvs_set_str(handle, "ip", TargetIp);
+    if (err == ESP_OK) err = nvs_set_u16(handle, "port", TargetPort);
+    if (err == ESP_OK) err = nvs_set_u32(handle, "dev_id", TargetDeviceInstance);
+    if (err == ESP_OK && TargetDeviceNameValid) {
+        err = nvs_set_str(handle, "name", TargetDeviceName);
+    }
+    if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
+    if (err != ESP_OK) return false;
+    bacnet_worker_set_target(TargetDeviceInstance, TargetIp, TargetPort);
+    return true;
 }
 
-static const room_config_t DefaultRooms[MAX_ROOMS] = {
-    { "Room A", true, 1100, 1101, 1101, 1102, 1105, 1106 },
-    { "Room B", true, 1200, 1201, 1201, 1202, 1205, 1206 },
-    { "Room C", false, 1300, 1301, 1301, 1302, 1305, 1306 },
-    { "Room D", false, 1400, 1401, 1401, 1402, 1405, 1406 },
-    { "Room E", false, 1500, 1501, 1501, 1502, 1505, 1506 },
-};
+static bool target_config_save(void)
+{
+    return run_internal_flash_op(target_config_save_direct, NULL);
+}
 
 static void rooms_config_load(void)
 {
-    /* Initialize with known working defaults first */
-    memcpy(Rooms, DefaultRooms, sizeof(DefaultRooms));
-    RoomCount = 5;
-
-    nvs_handle_t handle;
-    if (nvs_open(NVS_ROOMS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
-        return;
-    }
-    uint8_t count = 0;
-    if (nvs_get_u8(handle, "count", &count) == ESP_OK && count > 0 && count <= MAX_ROOMS) {
-        RoomCount = count;
-        for (size_t i = 0; i < RoomCount; i++) {
-            char key[32];
-            snprintf(key, sizeof(key), "r%u_name", (unsigned)i);
-            size_t nlen = sizeof(Rooms[i].name);
-            nvs_get_str(handle, key, Rooms[i].name, &nlen);
-
-            snprintf(key, sizeof(key), "r%u_act", (unsigned)i);
-            uint8_t act = 0;
-            if (nvs_get_u8(handle, key, &act) == ESP_OK) {
-                Rooms[i].active = (act != 0);
-            }
-
-            snprintf(key, sizeof(key), "r%u_sp", (unsigned)i);
-            uint32_t sp = 0;
-            if (nvs_get_u32(handle, key, &sp) == ESP_OK && sp > 0) Rooms[i].setpoint_instance = sp;
-
-            snprintf(key, sizeof(key), "r%u_temp", (unsigned)i);
-            uint32_t temp = 0;
-            if (nvs_get_u32(handle, key, &temp) == ESP_OK && temp > 0) Rooms[i].temperature_instance = temp;
-
-            snprintf(key, sizeof(key), "r%u_pwr", (unsigned)i);
-            uint32_t pwr = 0;
-            if (nvs_get_u32(handle, key, &pwr) == ESP_OK && pwr > 0) Rooms[i].power_instance = pwr;
-
-            snprintf(key, sizeof(key), "r%u_sa", (unsigned)i);
-            uint32_t sa = 0;
-            if (nvs_get_u32(handle, key, &sa) == ESP_OK && sa > 0) Rooms[i].supply_air_instance = sa;
-
-            snprintf(key, sizeof(key), "r%u_req", (unsigned)i);
-            uint32_t req = 0;
-            if (nvs_get_u32(handle, key, &req) == ESP_OK && req > 0) Rooms[i].required_output_instance = req;
-
-            snprintf(key, sizeof(key), "r%u_cur", (unsigned)i);
-            uint32_t cur = 0;
-            if (nvs_get_u32(handle, key, &cur) == ESP_OK && cur > 0) Rooms[i].current_output_instance = cur;
-        }
-    }
-    nvs_close(handle);
-
-    /* Sanity check defaults for any missing instances/names */
-    for (size_t i = 0; i < RoomCount; i++) {
-        if (Rooms[i].setpoint_instance == 0) Rooms[i].setpoint_instance = DefaultRooms[i < 5 ? i : 0].setpoint_instance;
-        if (Rooms[i].temperature_instance == 0) Rooms[i].temperature_instance = DefaultRooms[i < 5 ? i : 0].temperature_instance;
-        if (Rooms[i].power_instance == 0) Rooms[i].power_instance = DefaultRooms[i < 5 ? i : 0].power_instance;
-        if (Rooms[i].supply_air_instance == 0) Rooms[i].supply_air_instance = DefaultRooms[i < 5 ? i : 0].supply_air_instance;
-        if (Rooms[i].required_output_instance == 0) Rooms[i].required_output_instance = DefaultRooms[i < 5 ? i : 0].required_output_instance;
-        if (Rooms[i].current_output_instance == 0) Rooms[i].current_output_instance = DefaultRooms[i < 5 ? i : 0].current_output_instance;
-        if (Rooms[i].name[0] == '\0') {
-            strlcpy(Rooms[i].name, DefaultRooms[i < 5 ? i : 0].name, sizeof(Rooms[i].name));
-        }
-    }
+    hvac_core_rooms_load();
 }
 
-static void rooms_config_save(void)
+static bool rooms_config_save_direct(void *arg)
 {
-    nvs_handle_t handle;
-    if (nvs_open(NVS_ROOMS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
-    }
-    nvs_set_u8(handle, "count", (uint8_t)RoomCount);
-    for (size_t i = 0; i < RoomCount; i++) {
-        char key[32];
-        snprintf(key, sizeof(key), "r%u_name", (unsigned)i);
-        nvs_set_str(handle, key, Rooms[i].name);
-
-        snprintf(key, sizeof(key), "r%u_act", (unsigned)i);
-        nvs_set_u8(handle, key, Rooms[i].active ? 1 : 0);
-
-        snprintf(key, sizeof(key), "r%u_sp", (unsigned)i);
-        nvs_set_u32(handle, key, Rooms[i].setpoint_instance);
-        snprintf(key, sizeof(key), "r%u_temp", (unsigned)i);
-        nvs_set_u32(handle, key, Rooms[i].temperature_instance);
-        snprintf(key, sizeof(key), "r%u_pwr", (unsigned)i);
-        nvs_set_u32(handle, key, Rooms[i].power_instance);
-        snprintf(key, sizeof(key), "r%u_sa", (unsigned)i);
-        nvs_set_u32(handle, key, Rooms[i].supply_air_instance);
-        snprintf(key, sizeof(key), "r%u_req", (unsigned)i);
-        nvs_set_u32(handle, key, Rooms[i].required_output_instance);
-        snprintf(key, sizeof(key), "r%u_cur", (unsigned)i);
-        nvs_set_u32(handle, key, Rooms[i].current_output_instance);
-    }
-    nvs_commit(handle);
-    nvs_close(handle);
+    (void)arg;
+    hvac_core_rooms_save();
+    return true;
 }
+
+static bool rooms_config_save(void)
+{
+    return run_internal_flash_op(rooms_config_save_direct, NULL);
+}
+
+typedef struct {
+    hvac_integration_kind_t kind;
+    bool result;
+} integration_store_request_t;
+
+static bool integration_store_direct(void *arg)
+{
+    integration_store_request_t *request = (integration_store_request_t *)arg;
+    request->result = hvac_core_integration_set(request->kind);
+    return request->result;
+}
+
+static bool integration_store(hvac_integration_kind_t kind)
+{
+    integration_store_request_t request = {.kind = kind, .result = false};
+    return run_internal_flash_op(integration_store_direct, &request) && request.result;
+}
+
+typedef struct {
+    hvac_pairing_status_t status;
+    bool result;
+} pairing_store_request_t;
+
+static bool pairing_store_direct(void *arg)
+{
+    pairing_store_request_t *request = (pairing_store_request_t *)arg;
+    request->result = hvac_core_matter_pairing_set(request->status);
+    return request->result;
+}
+
+static bool pairing_store(hvac_pairing_status_t status)
+{
+    pairing_store_request_t request = {.status = status, .result = false};
+    return run_internal_flash_op(pairing_store_direct, &request) && request.result;
+}
+
 
 /* Whole-unit health/performance objects, confirmed to exist with matching
    name/units against discovery/device_753016_epics.txt (not yet individually
@@ -534,29 +538,11 @@ static const char *TAG_BAC = "bacnet_client";
 static volatile bool EthConnected = false;
 static esp_netif_t *EthNetif = NULL;
 
-static BACNET_ADDRESS Target_Address;
-static uint8_t Request_Invoke_ID = 0;
-static volatile bool Reply_Received = false;
-static volatile bool Reply_Errored = false;
-static BACNET_APPLICATION_DATA_VALUE Last_Read_Value;
-/* Raw (still-encoded) copy of the same ack's application data, captured
-   alongside Last_Read_Value. Needed by the /api/bacnet/explore endpoint to
-   decode array properties (e.g. Priority_Array's 16 back-to-back
-   application-tagged values) that bacapp_decode_application_data alone only
-   ever gives the first element of - every other reader in this file only
-   ever wants that first element, so they're untouched by this. */
-static uint8_t Last_Read_Raw[MAX_APDU];
-static int Last_Read_Raw_Len = 0;
+#define BacnetReady (bacnet_worker_is_ready())
 
-/* Guards the shared transaction state above (Target_Address, Request_Invoke_ID,
-   Reply_Received/Reply_Errored, Last_Read_Value) and the BACnet/IP socket, so the boot-time milestone
-   test and later on-demand reads triggered by HTTP status requests (a
-   different task) never interleave transactions. Created in app_main() before
-   any task that touches BACnet starts. */
-static SemaphoreHandle_t BacnetMutex;
-static volatile bool BacnetReady = false;
-static char TargetDeviceName[MAX_CHARACTER_STRING_BYTES + 1] = {0};
-static volatile bool TargetDeviceNameValid = false;
+static bacnet_discovered_dev_t DiscoveredDevices[MAX_DISCOVERED_DEVICES];
+static size_t DiscoveredDeviceCount = 0;
+static size_t DiscoveredDeviceSeenCount = 0;
 
 static void eth_event_handler(
     void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -575,547 +561,130 @@ static void eth_event_handler(
     }
 }
 
-static void my_error_handler(
-    BACNET_ADDRESS *src,
-    uint8_t invoke_id,
-    BACNET_ERROR_CLASS error_class,
-    BACNET_ERROR_CODE error_code)
+/* Set once by eth_ip_event_handler if DHCP actually assigns an address;
+ * read by the Ethernet bring-up sequence to decide whether to fall back to
+ * the static config below. Not reset afterward - a mid-session DHCP lease
+ * change/renewal is not this bridge's concern, only whether initial
+ * bring-up got an address. */
+static volatile bool EthGotDhcpIp = false;
+
+static void eth_ip_event_handler(
+    void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
-    if (address_match(&Target_Address, src) && (invoke_id == Request_Invoke_ID)) {
-        ESP_LOGE(TAG_BAC, "BACnet Error: class=%d code=%d", error_class, error_code);
-        Reply_Errored = true;
+    if (event_id == IP_EVENT_ETH_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG_BAC, "Ethernet DHCP assigned " IPSTR, IP2STR(&event->ip_info.ip));
+        EthGotDhcpIp = true;
     }
 }
 
-static void my_abort_handler(
-    BACNET_ADDRESS *src, uint8_t invoke_id, uint8_t abort_reason, bool server)
-{
-    (void)server;
-    if (address_match(&Target_Address, src) && (invoke_id == Request_Invoke_ID)) {
-        ESP_LOGE(TAG_BAC, "BACnet Abort: reason=%d", abort_reason);
-        Reply_Errored = true;
-    }
-}
-
-static void my_reject_handler(
-    BACNET_ADDRESS *src, uint8_t invoke_id, uint8_t reject_reason)
-{
-    if (address_match(&Target_Address, src) && (invoke_id == Request_Invoke_ID)) {
-        ESP_LOGE(TAG_BAC, "BACnet Reject: reason=%d", reject_reason);
-        Reply_Errored = true;
-    }
-}
-
-static void my_read_property_ack_handler(
-    uint8_t *service_request,
-    uint16_t service_len,
-    BACNET_ADDRESS *src,
-    BACNET_CONFIRMED_SERVICE_ACK_DATA *service_data)
-{
-    BACNET_READ_PROPERTY_DATA data;
-    int len;
-
-    if (!(address_match(&Target_Address, src) &&
-          (service_data->invoke_id == Request_Invoke_ID))) {
-        return;
-    }
-
-    len = rp_ack_decode_service_request(service_request, service_len, &data);
-    if (len < 0) {
-        ESP_LOGE(TAG_BAC, "ReadProperty ack: decode failed");
-        Reply_Errored = true;
-        return;
-    }
-
-    Last_Read_Raw_Len = data.application_data_len < (int)sizeof(Last_Read_Raw)
-        ? data.application_data_len : (int)sizeof(Last_Read_Raw);
-    memcpy(Last_Read_Raw, data.application_data, Last_Read_Raw_Len);
-
-    if (bacapp_decode_application_data(
-            data.application_data, (uint32_t)data.application_data_len,
-            &Last_Read_Value) < 0) {
-        ESP_LOGE(TAG_BAC, "ReadProperty ack: value decode failed");
-        Reply_Errored = true;
-        return;
-    }
-    Reply_Received = true;
-}
-
-static void my_write_property_simple_ack_handler(
-    BACNET_ADDRESS *src, uint8_t invoke_id)
-{
-    if (address_match(&Target_Address, src) && (invoke_id == Request_Invoke_ID)) {
-        ESP_LOGI(TAG_BAC, "WriteProperty ack: success (Simple-ACK)");
-        Reply_Received = true;
-    }
-}
-
-typedef struct {
-    uint32_t device_id;
-    char ip[16];
-    uint16_t port;
-    uint16_t vendor_id;
-    char name[48];
-    char vendor_name[48];
-    char model_name[48];
-} discovered_bacnet_dev_t;
-
-#define MAX_DISCOVERED_DEVICES 8
-static discovered_bacnet_dev_t DiscoveredDevices[MAX_DISCOVERED_DEVICES];
-static size_t DiscoveredDeviceCount = 0;
-
-static void my_i_am_handler(
-    uint8_t *service_request, uint16_t len, BACNET_ADDRESS *src)
-{
-    (void)len;
-    uint32_t device_id = 0;
-    unsigned max_apdu = 0;
-    int segmentation = 0;
-    uint16_t vendor_id = 0;
-
-    int decoded = iam_decode_service_request(
-        service_request, &device_id, &max_apdu, &segmentation, &vendor_id);
-    if (decoded <= 0 || !src) {
-        return;
-    }
-
-    char ip_str[16] = {0};
-    snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u",
-             src->mac[0], src->mac[1], src->mac[2], src->mac[3]);
-    uint16_t port = 0;
-    memcpy(&port, &src->mac[4], 2);
-    if (port == 0) port = 47808;
-
-    ESP_LOGI(TAG_BAC, "I-Am received: Device %u from %s:%u (Vendor %u)",
-             (unsigned)device_id, ip_str, (unsigned)port, (unsigned)vendor_id);
-
-    /* Bind in address cache */
-    address_add(device_id, max_apdu, src);
-
-    /* Deduplicate */
-    for (size_t i = 0; i < DiscoveredDeviceCount; i++) {
-        if (DiscoveredDevices[i].device_id == device_id &&
-            strcmp(DiscoveredDevices[i].ip, ip_str) == 0) {
-            return;
-        }
-    }
-
-    if (DiscoveredDeviceCount < MAX_DISCOVERED_DEVICES) {
-        size_t idx = DiscoveredDeviceCount++;
-        DiscoveredDevices[idx].device_id = device_id;
-        strlcpy(DiscoveredDevices[idx].ip, ip_str, sizeof(DiscoveredDevices[idx].ip));
-        DiscoveredDevices[idx].port = port;
-        DiscoveredDevices[idx].vendor_id = vendor_id;
-        snprintf(DiscoveredDevices[idx].vendor_name, sizeof(DiscoveredDevices[idx].vendor_name),
-                 vendor_id == 8 ? "Delta Controls" : "Vendor %u", (unsigned)vendor_id);
-        strlcpy(DiscoveredDevices[idx].model_name, "DAC Controller", sizeof(DiscoveredDevices[idx].model_name));
-        snprintf(DiscoveredDevices[idx].name, sizeof(DiscoveredDevices[idx].name),
-                 "Device %u", (unsigned)device_id);
-    }
-}
-
-static void init_bacnet_handlers(void)
-{
-    apdu_set_confirmed_ack_handler(
-        SERVICE_CONFIRMED_READ_PROPERTY, my_read_property_ack_handler);
-    apdu_set_confirmed_simple_ack_handler(
-        SERVICE_CONFIRMED_WRITE_PROPERTY, my_write_property_simple_ack_handler);
-    apdu_set_unconfirmed_handler(
-        SERVICE_UNCONFIRMED_I_AM, my_i_am_handler);
-    apdu_set_error_handler(SERVICE_CONFIRMED_READ_PROPERTY, my_error_handler);
-    apdu_set_error_handler(SERVICE_CONFIRMED_WRITE_PROPERTY, my_error_handler);
-    apdu_set_abort_handler(my_abort_handler);
-    apdu_set_reject_handler(my_reject_handler);
-}
-
-/* Mirrors `bacrp --mac <ip>:<port> --dnet 0` - pre-seed the address cache
-   directly instead of Who-Is/I-Am discovery (this panel doesn't answer
-   broadcast Who-Is). See bacnet_client's README for the mac[4:6] port
-   byte-order note - this deliberately does NOT use
-   bacnet_address_mac_from_ascii(). */
-static void bind_target_device(void)
-{
-    BACNET_ADDRESS dest = {0};
-    uint16_t native_port = TargetPort;
-    const char *ip_octets = TargetIp;
-    unsigned a, b, c, d;
-
-    sscanf(ip_octets, "%u.%u.%u.%u", &a, &b, &c, &d);
-    dest.mac[0] = (uint8_t)a;
-    dest.mac[1] = (uint8_t)b;
-    dest.mac[2] = (uint8_t)c;
-    dest.mac[3] = (uint8_t)d;
-    memcpy(&dest.mac[4], &native_port, 2);
-    dest.mac_len = 6;
-    dest.net = 0;
-    dest.len = 0;
-
-    address_add(TargetDeviceInstance, MAX_APDU, &dest);
-}
-
-static bool wait_for_transaction(void)
-{
-    if (Request_Invoke_ID == 0) {
-        return false;
-    }
-
-    uint32_t last_tick = xTaskGetTickCount();
-
-    /* 20 iterations of 25ms = 500ms max timeout. BACnet over local IP responds in < 50ms. */
-    for (int i = 0; i < 20; i++) {
-        uint8_t pdu[BIP_MPDU_MAX] = {0};
-        BACNET_ADDRESS src = {0};
-        uint16_t pdu_len = bip_receive(&src, pdu, sizeof(pdu), 0);
-        if (pdu_len) {
-            npdu_handler(&src, pdu, pdu_len);
-        }
-
-        uint32_t now = xTaskGetTickCount();
-        uint32_t elapsed_ms = (now - last_tick) * portTICK_PERIOD_MS;
-        if (elapsed_ms >= 100) {
-            tsm_timer_milliseconds(elapsed_ms);
-            last_tick = now;
-        }
-
-        if (Reply_Received || Reply_Errored) {
-            return Reply_Received;
-        }
-        if (tsm_invoke_id_free(Request_Invoke_ID)) {
-            return false;
-        }
-        if (tsm_invoke_id_failed(Request_Invoke_ID)) {
-            tsm_free_invoke_id(Request_Invoke_ID);
-            return false;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(25));
-    }
-
-    if (Request_Invoke_ID != 0) {
-        tsm_free_invoke_id(Request_Invoke_ID);
-    }
-    return false;
-}
-
-/* Raw transaction primitives - caller must already hold BacnetMutex. Every
-   typed helper below funnels through these two so there's exactly one place
-   that touches Reply_Received/Reply_Errored/Request_Invoke_ID/Last_Read_Value
-   and the bip socket. */
-static bool bacnet_read_locked_idx(
-    BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
-    BACNET_PROPERTY_ID property, uint32_t array_index,
-    BACNET_APPLICATION_DATA_VALUE *out_value)
-{
-    Reply_Received = false;
-    Reply_Errored = false;
-    Request_Invoke_ID = Send_Read_Property_Request(
-        TargetDeviceInstance, object_type, object_instance, property,
-        array_index);
-    if (!wait_for_transaction()) {
-        return false;
-    }
-    *out_value = Last_Read_Value;
-    return true;
-}
-
-static bool bacnet_read_locked(
-    BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
-    BACNET_PROPERTY_ID property, BACNET_APPLICATION_DATA_VALUE *out_value)
-{
-    return bacnet_read_locked_idx(
-        object_type, object_instance, property, BACNET_ARRAY_ALL, out_value);
-}
-
-static bool bacnet_write_locked_idx(
-    BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
-    BACNET_PROPERTY_ID property, BACNET_APPLICATION_DATA_VALUE *value,
-    uint8_t priority, uint32_t array_index)
-{
-    Reply_Received = false;
-    Reply_Errored = false;
-    Request_Invoke_ID = Send_Write_Property_Request(
-        TargetDeviceInstance, object_type, object_instance, property,
-        value, priority, array_index);
-    return wait_for_transaction();
-}
-
-static bool bacnet_write_locked(
-    BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
-    BACNET_PROPERTY_ID property, BACNET_APPLICATION_DATA_VALUE *value)
-{
-    return bacnet_write_locked_idx(
-        object_type, object_instance, property, value, BACNET_NO_PRIORITY,
-        BACNET_ARRAY_ALL);
-}
-
-/* xSemaphoreTake with a bounded wait so a slow/unreachable target can't hang
-   the caller's task indefinitely (matters for HTTP handlers, which run on
-   the httpd task). Returns false (without logging its own message - callers
-   log with context) on mutex timeout, transaction failure, or a
-   property/tag mismatch. */
-/* ===================== BACnet read cache =====================
-   Measured 2026-08-25: polling /api/status (which performs ~8 live BACnet
-   reads per refresh) took WiFi packet loss from 6.7% idle to 43.3%, while
-   hammering /api/network (HTTP with no BACnet reads) held 0.0% over 200
-   requests. HTTP serving is innocent; the W5500 traffic is what hurts the
-   radio. Every read avoided is SPI and Ethernet activity that does not
-   happen next to the antenna.
-
-   mqtt_state_task already polls the same points every 45s, so a dashboard
-   refresh can almost always be answered from what that poll already fetched.
-   Entries are invalidated precisely on write, so a setpoint or power change
-   made through the UI is reflected immediately rather than after the TTL. */
-#define BACNET_CACHE_ENTRIES 64
-#define BACNET_CACHE_TTL_MS  30000   /* < the 45s poll period, so staleness is bounded */
-
-typedef enum {
-    BC_KIND_NONE = 0,
-    BC_KIND_REAL,
-    BC_KIND_BOOL,
-    BC_KIND_MSV
-} bacnet_cache_kind_t;
-
-typedef struct {
-    uint16_t type;
-    uint32_t instance;
-    uint32_t property;
-    uint8_t  kind;
-    union { float f; bool b; unsigned u; } v;
-    int64_t  stamp_us;
-} bacnet_cache_entry_t;
-
-/* ~32B * 64 = ~2KB of .bss - affordable, and it buys a large cut in SPI traffic. */
-static bacnet_cache_entry_t BacnetCache[BACNET_CACHE_ENTRIES];
-static portMUX_TYPE BacnetCacheMux = portMUX_INITIALIZER_UNLOCKED;
-
-static bacnet_cache_entry_t *bacnet_cache_find(
-    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property)
-{
-    for (size_t i = 0; i < BACNET_CACHE_ENTRIES; i++) {
-        bacnet_cache_entry_t *e = &BacnetCache[i];
-        if (e->kind != BC_KIND_NONE && e->type == (uint16_t)type &&
-            e->instance == instance && e->property == (uint32_t)property) {
-            return e;
-        }
-    }
-    return NULL;
-}
-
-/* Returns the entry to write into: an existing one for this key, a free slot,
-   or the oldest entry if the table is full. */
-static bacnet_cache_entry_t *bacnet_cache_slot(
-    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property)
-{
-    bacnet_cache_entry_t *e = bacnet_cache_find(type, instance, property);
-    if (e) {
-        return e;
-    }
-    bacnet_cache_entry_t *oldest = &BacnetCache[0];
-    for (size_t i = 0; i < BACNET_CACHE_ENTRIES; i++) {
-        if (BacnetCache[i].kind == BC_KIND_NONE) {
-            return &BacnetCache[i];
-        }
-        if (BacnetCache[i].stamp_us < oldest->stamp_us) {
-            oldest = &BacnetCache[i];
-        }
-    }
-    return oldest;
-}
-
-static bool bacnet_cache_get(
-    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property,
-    bacnet_cache_kind_t kind, void *out)
-{
-    bool hit = false;
-    taskENTER_CRITICAL(&BacnetCacheMux);
-    bacnet_cache_entry_t *e = bacnet_cache_find(type, instance, property);
-    if (e && e->kind == (uint8_t)kind &&
-        (esp_timer_get_time() - e->stamp_us) / 1000 < BACNET_CACHE_TTL_MS) {
-        switch (kind) {
-            case BC_KIND_REAL: *(float *)out = e->v.f; break;
-            case BC_KIND_BOOL: *(bool *)out = e->v.b; break;
-            case BC_KIND_MSV:  *(unsigned *)out = e->v.u; break;
-            default: break;
-        }
-        hit = true;
-    }
-    taskEXIT_CRITICAL(&BacnetCacheMux);
-    return hit;
-}
-
-static void bacnet_cache_put(
-    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property,
-    bacnet_cache_kind_t kind, const void *val)
-{
-    taskENTER_CRITICAL(&BacnetCacheMux);
-    bacnet_cache_entry_t *e = bacnet_cache_slot(type, instance, property);
-    e->type = (uint16_t)type;
-    e->instance = instance;
-    e->property = (uint32_t)property;
-    e->kind = (uint8_t)kind;
-    switch (kind) {
-        case BC_KIND_REAL: e->v.f = *(const float *)val; break;
-        case BC_KIND_BOOL: e->v.b = *(const bool *)val; break;
-        case BC_KIND_MSV:  e->v.u = *(const unsigned *)val; break;
-        default: break;
-    }
-    e->stamp_us = esp_timer_get_time();
-    taskEXIT_CRITICAL(&BacnetCacheMux);
-}
-
-/* Called after every successful write so the UI never shows a value it just
-   changed. Precise: only the written point is dropped. */
-static void bacnet_cache_invalidate(
-    BACNET_OBJECT_TYPE type, uint32_t instance, BACNET_PROPERTY_ID property)
-{
-    taskENTER_CRITICAL(&BacnetCacheMux);
-    bacnet_cache_entry_t *e = bacnet_cache_find(type, instance, property);
-    if (e) {
-        e->kind = BC_KIND_NONE;
-        e->stamp_us = 0;
-    }
-    taskEXIT_CRITICAL(&BacnetCacheMux);
-}
-
-static bool read_real_property(
+static inline bool read_real_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, float *out_value)
 {
-    if (bacnet_cache_get(object_type, object_instance, property, BC_KIND_REAL, out_value)) {
-        return true;
-    }
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        ESP_LOGW(TAG_BAC, "read_real_property: BACnet busy, timed out waiting for mutex");
-        return false;
-    }
-    BACNET_APPLICATION_DATA_VALUE v;
-    bool ok = bacnet_read_locked(object_type, object_instance, property, &v);
-    xSemaphoreGive(BacnetMutex);
-    if (ok && v.tag != BACNET_APPLICATION_TAG_REAL) {
-        ESP_LOGE(TAG_BAC, "Expected REAL value, got tag=%d", v.tag);
-        return false;
-    }
-    if (ok) {
-        *out_value = v.type.Real;
-        bacnet_cache_put(object_type, object_instance, property, BC_KIND_REAL, out_value);
-    }
-    return ok;
+    return bacnet_worker_read_real(object_type, object_instance, property, out_value);
 }
 
-static bool write_real_property(
+static inline bool write_real_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, float value)
 {
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        ESP_LOGW(TAG_BAC, "write_real_property: BACnet busy, timed out waiting for mutex");
-        return false;
-    }
-    BACNET_APPLICATION_DATA_VALUE v = {0};
-    v.tag = BACNET_APPLICATION_TAG_REAL;
-    v.type.Real = value;
-    bool ok = bacnet_write_locked(object_type, object_instance, property, &v);
-    xSemaphoreGive(BacnetMutex);
-    if (ok) {
-        /* Drop the cached copy so the very next read reflects what we wrote,
-           rather than serving the pre-write value for up to the TTL. */
-        bacnet_cache_invalidate(object_type, object_instance, property);
-    }
-    return ok;
+    return bacnet_worker_write_real(object_type, object_instance, property, value);
 }
 
-/* binary-value present-value: BACNET_APPLICATION_TAG_ENUMERATED, 0=inactive/off, 1=active/on. */
-static bool read_bool_property(
+static inline bool read_bool_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, bool *out_value)
 {
-    if (bacnet_cache_get(object_type, object_instance, property, BC_KIND_BOOL, out_value)) {
-        return true;
-    }
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        ESP_LOGW(TAG_BAC, "read_bool_property: BACnet busy, timed out waiting for mutex");
-        return false;
-    }
-    BACNET_APPLICATION_DATA_VALUE v;
-    bool ok = bacnet_read_locked(object_type, object_instance, property, &v);
-    xSemaphoreGive(BacnetMutex);
-    if (ok && v.tag != BACNET_APPLICATION_TAG_ENUMERATED) {
-        ESP_LOGE(TAG_BAC, "Expected ENUMERATED value, got tag=%d", v.tag);
-        return false;
-    }
-    if (ok) {
-        *out_value = v.type.Enumerated != 0;
-        bacnet_cache_put(object_type, object_instance, property, BC_KIND_BOOL, out_value);
-    }
-    return ok;
+    return bacnet_worker_read_bool(object_type, object_instance, property, out_value);
 }
 
-static bool write_bool_property(
+static inline bool write_bool_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, bool value)
 {
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        ESP_LOGW(TAG_BAC, "write_bool_property: BACnet busy, timed out waiting for mutex");
-        return false;
-    }
-    BACNET_APPLICATION_DATA_VALUE v = {0};
-    v.tag = BACNET_APPLICATION_TAG_ENUMERATED;
-    v.type.Enumerated = value ? 1 : 0;
-    bool ok = bacnet_write_locked(object_type, object_instance, property, &v);
-    xSemaphoreGive(BacnetMutex);
-    if (ok) {
-        /* Drop the cached copy so the very next read reflects what we wrote,
-           rather than serving the pre-write value for up to the TTL. */
-        bacnet_cache_invalidate(object_type, object_instance, property);
-    }
-    return ok;
+    return bacnet_worker_write_bool(object_type, object_instance, property, value);
 }
 
-/* multi-state-value present-value: BACNET_APPLICATION_TAG_UNSIGNED_INT, 1-based state index. */
-static bool read_msv_property(
+static inline bool read_msv_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, unsigned *out_value)
 {
-    if (bacnet_cache_get(object_type, object_instance, property, BC_KIND_MSV, out_value)) {
-        return true;
-    }
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        ESP_LOGW(TAG_BAC, "read_msv_property: BACnet busy, timed out waiting for mutex");
-        return false;
-    }
-    BACNET_APPLICATION_DATA_VALUE v;
-    bool ok = bacnet_read_locked(object_type, object_instance, property, &v);
-    xSemaphoreGive(BacnetMutex);
-    if (ok && v.tag != BACNET_APPLICATION_TAG_UNSIGNED_INT) {
-        ESP_LOGE(TAG_BAC, "Expected UNSIGNED_INT value, got tag=%d", v.tag);
-        return false;
-    }
-    if (ok) {
-        *out_value = (unsigned)v.type.Unsigned_Int;
-        bacnet_cache_put(object_type, object_instance, property, BC_KIND_MSV, out_value);
-    }
-    return ok;
+    return bacnet_worker_read_msv(object_type, object_instance, property, out_value);
 }
 
-static bool write_msv_property(
+static inline bool write_msv_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, unsigned value)
 {
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        ESP_LOGW(TAG_BAC, "write_msv_property: BACnet busy, timed out waiting for mutex");
-        return false;
-    }
-    BACNET_APPLICATION_DATA_VALUE v = {0};
-    v.tag = BACNET_APPLICATION_TAG_UNSIGNED_INT;
-    v.type.Unsigned_Int = value;
-    bool ok = bacnet_write_locked(object_type, object_instance, property, &v);
-    xSemaphoreGive(BacnetMutex);
-    if (ok) {
-        /* Drop the cached copy so the very next read reflects what we wrote,
-           rather than serving the pre-write value for up to the TTL. */
-        bacnet_cache_invalidate(object_type, object_instance, property);
-    }
-    return ok;
+    return bacnet_worker_write_msv(object_type, object_instance, property, value);
 }
+
+/* Matter's system endpoint is a plain OnOff switch: there is no home-level
+ * temperature control or mode, only whether the plant is allowed to run.
+ * Boost Heat/Boost Cool are BACnet-level plant commands (see boost_apply()
+ * above) and are intentionally not reachable from Matter - only from the
+ * web UI/API - so this never touches boost state. */
+static bool matter_system_power_write(bool on)
+{
+    return hvac_core_set_system_power(on);
+}
+
+static bool matter_system_power_read(bool *out_on)
+{
+    if (!out_on) return false;
+    return hvac_core_get_system_power_commanded(out_on);
+}
+
+/* Two OnOff switches ("Boost Heat"/"Boost Cool") over one tri-state BACnet
+ * boost mode. Mutual exclusion lives here, not in matter_adapter: turning a
+ * switch on selects that boost; turning the currently-active one off
+ * returns to Auto (no boost). Turning off the inactive switch is a no-op -
+ * matter_adapter never reports it as on in the first place, so a genuine
+ * write there would mean a stale controller cache, not a real request. */
+static bool matter_boost_write(matter_boost_target_t target, bool on)
+{
+    unsigned mode = on
+        ? (target == MATTER_BOOST_TARGET_HEAT ? BOOST_MODE_FULL_HEATING : BOOST_MODE_FULL_COOLING)
+        : BOOST_MODE_AUTO;
+    return boost_apply(mode, true);
+}
+
+static bool matter_boost_read(matter_system_mode_t *out_mode)
+{
+    if (!out_mode) return false;
+    unsigned boost_mode = BOOST_MODE_AUTO;
+    if (BacnetReady && read_msv_property(OBJECT_MULTI_STATE_VALUE, BOOST_INSTANCE,
+                                         PROP_PRESENT_VALUE, &boost_mode)) {
+        if (boost_mode == BOOST_MODE_FULL_HEATING) {
+            *out_mode = MATTER_SYSTEM_MODE_HEAT;
+            return true;
+        }
+        if (boost_mode == BOOST_MODE_FULL_COOLING) {
+            *out_mode = MATTER_SYSTEM_MODE_COOL;
+            return true;
+        }
+    }
+    *out_mode = MATTER_SYSTEM_MODE_AUTO;
+    return true;
+}
+
+/* ===================== Protocol-neutral HVAC commands ===================== */
+static inline bool hvac_command_room_setpoint(size_t room_idx, float requested, float *applied)
+{
+    return hvac_core_set_room_setpoint(room_idx, requested, applied);
+}
+
+static inline bool hvac_command_room_power(size_t room_idx, bool on)
+{
+    return hvac_core_set_room_power(room_idx, on);
+}
+
+static inline bool hvac_command_system_power(bool on)
+{
+    return hvac_core_set_system_power(on);
+}
+
 
 /* ---- Generic BACnet explorer (read/write any object/property) ----
    Backs /api/bacnet/read and /api/bacnet/write. Unlike the typed helpers
@@ -1208,24 +777,19 @@ static void explorer_read(
         snprintf(out, out_len, "{\"ok\":false,\"error\":\"bacnet not ready\"}");
         return;
     }
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        snprintf(out, out_len, "{\"ok\":false,\"error\":\"bacnet busy, timed out waiting for mutex\"}");
-        return;
-    }
-    BACNET_APPLICATION_DATA_VALUE v;
-    bool ok = bacnet_read_locked_idx(object_type, object_instance, property, array_index, &v);
-    static uint8_t raw_copy[MAX_APDU];
-    int raw_len = 0;
-    if (ok) {
-        raw_len = Last_Read_Raw_Len;
-        if (raw_len > 0 && raw_len <= (int)sizeof(raw_copy)) {
-            memcpy(raw_copy, Last_Read_Raw, raw_len);
-        }
-    }
-    xSemaphoreGive(BacnetMutex);
 
-    if (!ok) {
-        snprintf(out, out_len, "{\"ok\":false,\"error\":\"read failed (timeout or BACnet error - see device log)\"}");
+    bacnet_response_t resp = {0};
+    bacnet_status_t status = bacnet_worker_explorer_read_sync(
+        object_type, object_instance, property, array_index, &resp, 1000);
+
+    if (status != BACNET_WORKER_STATUS_OK) {
+        if (status == BACNET_WORKER_STATUS_TARGET_OFFLINE) {
+            snprintf(out, out_len, "{\"ok\":false,\"error\":\"target offline\"}");
+        } else if (status == BACNET_WORKER_STATUS_TIMEOUT) {
+            snprintf(out, out_len, "{\"ok\":false,\"error\":\"read timeout\"}");
+        } else {
+            snprintf(out, out_len, "{\"ok\":false,\"error\":\"read failed (timeout or BACnet error - see device log)\"}");
+        }
         return;
     }
 
@@ -1233,10 +797,10 @@ static void explorer_read(
         size_t pos = (size_t)snprintf(out, out_len, "{\"ok\":true,\"tag\":\"priority-array\",\"values\":[");
         int offset = 0;
         int slot = 0;
-        while (offset < raw_len && slot < 16 && pos < out_len - 32) {
+        while (offset < resp.raw_data_len && slot < 16 && pos < out_len - 32) {
             BACNET_APPLICATION_DATA_VALUE elem = {0};
             int consumed = bacapp_decode_application_data(
-                raw_copy + offset, (uint32_t)(raw_len - offset), &elem);
+                resp.raw_data + offset, (uint32_t)(resp.raw_data_len - offset), &elem);
             if (consumed <= 0) {
                 break;
             }
@@ -1257,9 +821,9 @@ static void explorer_read(
 
     size_t pos = (size_t)snprintf(
         out, out_len, "{\"ok\":true,\"tag\":\"%s\",\"value\":",
-        bactext_application_tag_name_default(v.tag, "unknown"));
+        bactext_application_tag_name_default(resp.tag, "unknown"));
     if (pos < out_len - 32) {
-        pos += append_value_json(out + pos, out_len - pos, &v);
+        pos += append_value_json(out + pos, out_len - pos, &resp.app_val);
     }
     if (pos < out_len - 2) {
         snprintf(out + pos, out_len - pos, "}");
@@ -1296,15 +860,10 @@ static void explorer_write(
         return;
     }
 
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        snprintf(out, out_len, "{\"ok\":false,\"error\":\"bacnet busy, timed out waiting for mutex\"}");
-        return;
-    }
-    bool ok = bacnet_write_locked_idx(
-        object_type, object_instance, property, &v, priority, array_index);
-    xSemaphoreGive(BacnetMutex);
+    bacnet_status_t status = bacnet_worker_explorer_write_sync(
+        object_type, object_instance, property, array_index, priority, &v, 1000);
 
-    if (!ok) {
+    if (status != BACNET_WORKER_STATUS_OK) {
         snprintf(out, out_len, "{\"ok\":false,\"error\":\"write failed (timeout or BACnet error - see device log)\"}");
         return;
     }
@@ -1343,94 +902,7 @@ static bool parse_property_id(const char *s, BACNET_PROPERTY_ID *out)
     return true;
 }
 
-/* Milestone test sequence (see firmware/bacnet_bridge git history for the
-   individual ReadProperty/WriteProperty proofs this was built from). Not
-   the shape of the final firmware, which drives writes from MQTT commands
-   instead of a hardcoded sequence. */
-static void bacnet_client_task(void *arg)
-{
-    unsigned max_apdu = 0;
-    char name[MAX_CHARACTER_STRING_BYTES + 1] = {0};
-    float setpoint = 0.0f;
 
-    ESP_LOGI(TAG_BAC, "Starting BACnet/IP datalink on port %u", TargetPort);
-    bip_socket_esp_idf_set_netif(EthNetif);
-    if (!bip_init(TargetPort)) {
-        ESP_LOGE(TAG_BAC, "bip_init() failed");
-        task_registry_remove_self();
-    vTaskDelete(NULL);
-        return;
-    }
-
-    address_init();
-    init_bacnet_handlers();
-
-    /* Retry the bind indefinitely with a 5s backoff instead of giving up after
-       one failure. Added 2026-08-23: this used to vTaskDelete on a single
-       failed address_bind_request, which left BacnetReady false forever - the
-       bridge would sit there with the controller fully reachable (verified
-       independently) but never bind, needing a manual power cycle to recover.
-       bind_target_device() just re-seeds the address cache from static config,
-       cheap to repeat. */
-    int bind_attempt = 0;
-    for (;;) {
-        bind_target_device();
-        if (address_bind_request(TargetDeviceInstance, &max_apdu, &Target_Address)) {
-            break;
-        }
-        bind_attempt++;
-        ESP_LOGE(TAG_BAC, "address_bind_request failed (attempt %d) - retrying in 5s", bind_attempt);
-        diag_log("bacnet bind failed (attempt %d) - retrying in 5s", bind_attempt);
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-    if (bind_attempt > 0) {
-        diag_log("bacnet bind succeeded after %d retries", bind_attempt);
-    }
-    /* Target is bound and the datalink/handlers are up - safe from here on
-       for other tasks (e.g. the HTTP status handler) to also send requests,
-       serialized through BacnetMutex. */
-    BacnetReady = true;
-
-    ESP_LOGI(TAG_BAC, "--- ReadProperty Device object-name ---");
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        ESP_LOGE(TAG_BAC, "Device object-name read: could not get BacnetMutex");
-        goto done;
-    }
-    Reply_Received = false;
-    Reply_Errored = false;
-    Request_Invoke_ID = Send_Read_Property_Request(
-        TargetDeviceInstance, OBJECT_DEVICE, TargetDeviceInstance,
-        PROP_OBJECT_NAME, BACNET_ARRAY_ALL);
-    bool name_ok = wait_for_transaction() &&
-        Last_Read_Value.tag == BACNET_APPLICATION_TAG_CHARACTER_STRING;
-    if (name_ok) {
-        copy_character_string(name, sizeof(name), (const BACNET_CHARACTER_STRING *)&Last_Read_Value.type.Character_String);
-    }
-    xSemaphoreGive(BacnetMutex);
-
-    if (name_ok) {
-        ESP_LOGI(TAG_BAC, "Read OK: object-name = \"%s\"", name);
-        strlcpy(TargetDeviceName, name, sizeof(TargetDeviceName));
-        TargetDeviceNameValid = true;
-    } else {
-        ESP_LOGE(TAG_BAC, "Device object-name read FAILED");
-        goto done;
-    }
-
-    ESP_LOGI(TAG_BAC, "--- ReadProperty Room B Setpoint ---");
-    if (!read_real_property(
-            OBJECT_ANALOG_VALUE, Rooms[1].setpoint_instance, PROP_PRESENT_VALUE, &setpoint)) {
-        ESP_LOGE(TAG_BAC, "Room B Setpoint read FAILED");
-        goto done;
-    }
-    ESP_LOGI(TAG_BAC, "Room B Setpoint = %.1fC", setpoint);
-    ESP_LOGI(TAG_BAC, "=== BACnet client task PASSED ===");
-
-done:
-    ESP_LOGI(TAG_BAC, "BACnet client task done");
-    task_registry_remove_self();
-    vTaskDelete(NULL);
-}
 
 static volatile int PingSuccessCount = 0;
 static volatile int PingTimeoutCount = 0;
@@ -1529,21 +1001,46 @@ static void eth_bringup_task(void *arg)
     esp_eth_netif_glue_handle_t glue = esp_eth_new_netif_glue(eth_handles[0]);
     ESP_ERROR_CHECK(esp_netif_attach(EthNetif, glue));
 
-    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(EthNetif));
-    esp_netif_ip_info_t ip_info = {0};
-    ip4addr_aton(LOCAL_STATIC_IP, (ip4_addr_t *)&ip_info.ip);
-    ip4addr_aton(LOCAL_NETMASK, (ip4_addr_t *)&ip_info.netmask);
-    ip4addr_aton(LOCAL_GATEWAY, (ip4_addr_t *)&ip_info.gw);
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(EthNetif, &ip_info));
-    ESP_LOGI(TAG_BAC, "Static IP configured: %s", LOCAL_STATIC_IP);
-
+    /* Try DHCP first rather than assuming this specific static IP is right
+     * for whatever segment this bridge actually ends up on - falls back to
+     * the historical static config below only if nothing answers within a
+     * few seconds. The isolated BACnet segment this bridge targets
+     * typically runs no DHCP server (part of why it's isolated), so this
+     * usually times out and costs a few seconds of boot; a differently
+     * set up segment that does run DHCP now gets a correct address
+     * instead of silently colliding with or missing this hardcoded one. */
     ESP_ERROR_CHECK(
         esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_ip_event_handler, NULL));
     ESP_ERROR_CHECK(esp_eth_start(eth_handles[0]));
 
     ESP_LOGI(TAG_BAC, "Waiting for Ethernet link...");
     while (!EthConnected) {
         vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    ESP_LOGI(TAG_BAC, "Link up - waiting up to 5s for DHCP...");
+    for (int waited_ms = 0; waited_ms < 5000 && !EthGotDhcpIp; waited_ms += 200) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    if (EthGotDhcpIp) {
+        esp_netif_ip_info_t dhcp_info = {0};
+        esp_netif_get_ip_info(EthNetif, &dhcp_info);
+        char dhcp_ip_str[16];
+        esp_ip4addr_ntoa(&dhcp_info.ip, dhcp_ip_str, sizeof(dhcp_ip_str));
+        ESP_LOGI(TAG_BAC, "DHCP IP configured: %s", dhcp_ip_str);
+        diag_log("eth DHCP assigned %s", dhcp_ip_str);
+    } else {
+        ESP_LOGI(TAG_BAC, "No DHCP response - falling back to static IP");
+        ESP_ERROR_CHECK(esp_netif_dhcpc_stop(EthNetif));
+        esp_netif_ip_info_t ip_info = {0};
+        ip4addr_aton(LOCAL_STATIC_IP, (ip4_addr_t *)&ip_info.ip);
+        ip4addr_aton(LOCAL_NETMASK, (ip4_addr_t *)&ip_info.netmask);
+        ip4addr_aton(LOCAL_GATEWAY, (ip4_addr_t *)&ip_info.gw);
+        ESP_ERROR_CHECK(esp_netif_set_ip_info(EthNetif, &ip_info));
+        ESP_LOGI(TAG_BAC, "Static IP configured: %s", LOCAL_STATIC_IP);
     }
 
     ping_test();
@@ -1559,29 +1056,17 @@ static void eth_bringup_task(void *arg)
        after a flash shows broken BACnet reads for 60-200s, a second plain
        reset clears it" quirk documented in docs/LOGGING_TOOLS.md - it is a
        heap race against MQTT connecting, nothing to do with flashing, and the
-       second reset merely reshuffles the timing. */
-    /* Statically allocated stack. Retrying xTaskCreate() was not enough: with
-       33K of total free heap the create still failed, because a task stack
-       needs 24576 CONTIGUOUS bytes of internal DRAM and by the time WiFi, the
-       HTTP server and MQTT have all initialised, the heap is fragmented below
-       that even when the total looks ample. Reserving the stack in .bss makes
-       the allocation unconditional and immune to both fragmentation and
-       start-up ordering. It costs nothing extra at runtime - this task lives
-       for the life of the device, so the memory was never going to be
-       reclaimed anyway. Removes the last of the "BACnet silently never
-       started" failure mode for good. */
-    static StaticTask_t BacnetTcb;
-    static StackType_t BacnetStack[24576 / sizeof(StackType_t)];
-    TaskHandle_t bacnet_handle = xTaskCreateStatic(
-        bacnet_client_task, "bacnet_client",
-        sizeof(BacnetStack) / sizeof(StackType_t), NULL, 5, BacnetStack, &BacnetTcb);
-    if (bacnet_handle == NULL) {
-        ESP_LOGE(TAG_BAC, "bacnet_client task could not be created - no BACnet this boot");
-        diag_log("bacnet task create failed - no BACnet this boot");
+       second reset merely reshuffles the timing. */    
+    /* Start dedicated BACnet worker queue */
+    esp_err_t worker_err = bacnet_worker_start(EthNetif, TargetDeviceInstance, TargetIp, TargetPort);
+    if (worker_err != ESP_OK) {
+        ESP_LOGE(TAG_BAC, "bacnet_worker_start failed - no BACnet this boot");
+        diag_log("bacnet worker start failed - no BACnet this boot");
     } else {
-        /* Statically created, so it never goes through spawn_task() - register
-           it by hand so /api/debug/stacks covers it like the rest. */
-        task_registry_add("bacnet_client", bacnet_handle, sizeof(BacnetStack));
+        TaskHandle_t bacnet_handle = bacnet_worker_get_task_handle();
+        if (bacnet_handle) {
+            task_registry_add("bacnet_worker", bacnet_handle, BACNET_WORKER_STACK_SIZE);
+        }
     }
     task_registry_remove_self();
     vTaskDelete(NULL);
@@ -1615,8 +1100,8 @@ extern const char objects_page_start[] asm("_binary_objects_html_start");
 extern const char objects_page_end[] asm("_binary_objects_html_end");
 extern const char wizard_page_start[] asm("_binary_wizard_html_start");
 extern const char wizard_page_end[] asm("_binary_wizard_html_end");
-extern const char mqtt_page_start[] asm("_binary_mqtt_html_start");
-extern const char mqtt_page_end[] asm("_binary_mqtt_html_end");
+extern const char smart_home_page_start[] asm("_binary_smart_home_html_start");
+extern const char smart_home_page_end[] asm("_binary_smart_home_html_end");
 
 static const char *TAG_WIFI = "wifi_prov";
 static EventGroupHandle_t WifiEventGroup;
@@ -1732,16 +1217,24 @@ static void wizard_completed_load(void)
     nvs_close(handle);
 }
 
-static void wizard_completed_save(void)
+static bool wizard_completed_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
-    nvs_set_u8(handle, NVS_KEY_WIZARD_DONE, 1);
-    nvs_commit(handle);
+    esp_err_t err = nvs_set_u8(handle, NVS_KEY_WIZARD_DONE, 1);
+    if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
+    if (err != ESP_OK) return false;
     WizardCompleted = true;
+    return true;
+}
+
+static bool wizard_completed_save(void)
+{
+    return run_internal_flash_op(wizard_completed_save_direct, NULL);
 }
 
 static bool load_wifi_credentials(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
@@ -1765,7 +1258,7 @@ static bool load_wifi_credentials(char *ssid, size_t ssid_len, char *pass, size_
     return strlen(ssid) > 0;
 }
 
-static esp_err_t save_wifi_credentials(const char *ssid, const char *pass)
+static esp_err_t save_wifi_credentials_direct(const char *ssid, const char *pass)
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -1781,6 +1274,25 @@ static esp_err_t save_wifi_credentials(const char *ssid, const char *pass)
     }
     nvs_close(handle);
     return err;
+}
+
+typedef struct {
+    const char *ssid;
+    const char *pass;
+    esp_err_t result;
+} wifi_store_request_t;
+
+static bool wifi_store_direct(void *arg)
+{
+    wifi_store_request_t *request = (wifi_store_request_t *)arg;
+    request->result = save_wifi_credentials_direct(request->ssid, request->pass);
+    return request->result == ESP_OK;
+}
+
+static esp_err_t save_wifi_credentials(const char *ssid, const char *pass)
+{
+    wifi_store_request_t request = {.ssid = ssid, .pass = pass, .result = ESP_FAIL};
+    return run_internal_flash_op(wifi_store_direct, &request) ? request.result : ESP_FAIL;
 }
 
 static void sta_event_handler(
@@ -2274,7 +1786,7 @@ static esp_err_t api_network_get_handler(httpd_req_t *req)
         StaSsid, StaIp, rssi_json, EthConnected ? "true" : "false", name_json, TargetIp,
         (long long)uptime_s, reset_reason, reset_is_power_issue ? "true" : "false",
         ota_password_is_set() ? "true" : "false",
-        MdnsEnabled ? "true" : "false", MDNS_HOSTNAME);
+        MdnsEnabled ? "true" : "false", MdnsHostname);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, off);
@@ -2300,6 +1812,8 @@ static const httpd_uri_t api_version_uri = {
 
 static esp_err_t api_status_get_handler(httpd_req_t *req)
 {
+    ESP_LOGI(TAG_WIFI, "HTTP dispatch GET /api/status; stack HWM=%u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     int64_t __req_start_us = esp_timer_get_time();
     diag_log("http GET /api/status start");
     if (!EthConnected) {
@@ -2313,8 +1827,8 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
     bool sys_power_valid = BacnetReady && read_bool_property(
         OBJECT_BINARY_VALUE, SYS_POWER_READBACK_INSTANCE, PROP_PRESENT_VALUE, &sys_power);
     bool sys_power_commanded = false;
-    bool sys_power_commanded_valid = BacnetReady && read_bool_property(
-        OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, &sys_power_commanded);
+    bool sys_power_commanded_valid = BacnetReady &&
+        hvac_core_get_system_power_commanded(&sys_power_commanded);
 
     unsigned boost_mode = 0;
     bool boost_valid = BacnetReady &&
@@ -2328,11 +1842,13 @@ static esp_err_t api_status_get_handler(httpd_req_t *req)
         "\"sys_power_commanded_valid\":%s,\"sys_power_commanded\":%s,"
         "\"boost_valid\":%s,\"boost_mode\":%u,"
         "\"boost_timeout_minutes\":%u,\"boost_remaining_minutes\":%d,"
+        "\"integration_mode\":%d,"
         "\"rooms\":[",
         sys_power_valid ? "true" : "false", sys_power ? "true" : "false",
         sys_power_commanded_valid ? "true" : "false", sys_power_commanded ? "true" : "false",
         boost_valid ? "true" : "false", boost_mode,
-        (unsigned)BoostTimeoutMinutes, boost_remaining_minutes());
+        (unsigned)BoostTimeoutMinutes, boost_remaining_minutes(),
+        (int)hvac_core_integration_get());
 
     bool first_room = true;
     for (size_t i = 0; i < RoomCount && off < sizeof(buf); i++) {
@@ -2932,14 +2448,7 @@ static esp_err_t api_room_setpoint_post_handler(httpd_req_t *req)
     }
 
     float value = strtof(value_str, NULL);
-    if (value < MIN_SETPOINT_C) {
-        /* Touchscreen-enforced floor - BACnet itself doesn't stop a lower
-           write (confirmed in Phase 0.5 testing), so clamp here instead. */
-        value = MIN_SETPOINT_C;
-    }
-
-    bool ok = BacnetReady && write_real_property(
-        OBJECT_ANALOG_VALUE, Rooms[room_idx].setpoint_instance, PROP_PRESENT_VALUE, value);
+    bool ok = hvac_command_room_setpoint((size_t)room_idx, value, &value);
     char resp[64];
     snprintf(resp, sizeof(resp), "{\"ok\":true,\"setpoint\":%.1f}", value);
     send_write_result(req, ok, resp);
@@ -2967,8 +2476,7 @@ static esp_err_t api_room_power_post_handler(httpd_req_t *req)
     }
 
     bool on = strcmp(value_str, "on") == 0;
-    bool ok = BacnetReady && write_bool_property(
-        OBJECT_BINARY_VALUE, Rooms[room_idx].power_instance, PROP_PRESENT_VALUE, on);
+    bool ok = hvac_command_room_power((size_t)room_idx, on);
     diag_log("room-power room=%d value=%s ok=%d", room_idx, value_str, ok);
     send_write_result(req, ok, NULL);
     return ESP_OK;
@@ -2976,18 +2484,6 @@ static esp_err_t api_room_power_post_handler(httpd_req_t *req)
 
 static const httpd_uri_t api_room_power_uri = {
     .uri = "/api/room-power", .method = HTTP_POST, .handler = api_room_power_post_handler};
-
-/* BV:13 is the point we write - reading it back reports exactly what was
- * last commanded, independent of whether anything is actually running
- * (BV:1, "Running now") and independent of per-room state. Room power is
- * deliberately left untouched by System Power: they're functionally
- * separate so the same room configuration survives a system-off/on cycle
- * without the user re-setting anything. */
-static bool system_power_commanded(bool *out_val)
-{
-    if (!BacnetReady || !out_val) return false;
-    return read_bool_property(OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, out_val);
-}
 
 static esp_err_t api_system_power_post_handler(httpd_req_t *req)
 {
@@ -3004,8 +2500,7 @@ static esp_err_t api_system_power_post_handler(httpd_req_t *req)
     }
 
     bool on = strcmp(value_str, "on") == 0;
-    bool ok = BacnetReady && write_bool_property(
-        OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, on);
+    bool ok = hvac_command_system_power(on);
     diag_log("system-power value=%s ok=%d", value_str, ok);
     send_write_result(req, ok, NULL);
     return ESP_OK;
@@ -3106,7 +2601,7 @@ static esp_err_t api_device_mdns_post_handler(httpd_req_t *req)
     char resp[96];
     snprintf(resp, sizeof(resp),
              "{\"ok\":true,\"mdns_enabled\":%s,\"hostname\":\"%s.local\"}",
-             MdnsEnabled ? "true" : "false", MDNS_HOSTNAME);
+             MdnsEnabled ? "true" : "false", MdnsHostname);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -3169,14 +2664,25 @@ static esp_err_t api_debug_stacks_get_handler(httpd_req_t *req)
 static const httpd_uri_t api_debug_stacks_uri = {
     .uri = "/api/debug/stacks", .method = HTTP_GET, .handler = api_debug_stacks_get_handler};
 
-static esp_err_t api_wifi_reset_post_handler(httpd_req_t *req)
+static bool wifi_credentials_erase_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_key(handle, NVS_KEY_SSID);
-        nvs_erase_key(handle, NVS_KEY_PASS);
-        nvs_commit(handle);
+        esp_err_t err = nvs_erase_key(handle, NVS_KEY_SSID);
+        if (err == ESP_OK) err = nvs_erase_key(handle, NVS_KEY_PASS);
+        if (err == ESP_OK) err = nvs_commit(handle);
         nvs_close(handle);
+        return err == ESP_OK;
+    }
+    return false;
+}
+
+static esp_err_t api_wifi_reset_post_handler(httpd_req_t *req)
+{
+    if (!run_internal_flash_op(wifi_credentials_erase_direct, NULL)) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
     }
 
     ESP_LOGI(TAG_WIFI, "WiFi credentials cleared via dashboard, restarting in 2s...");
@@ -3233,15 +2739,62 @@ static void ota_password_load(void)
     }
 }
 
-static void ota_password_store(const char *pw)
+typedef struct {
+    char password[OTA_PASSWORD_MAX_LEN + 1];
+    SemaphoreHandle_t finished;
+    bool ok;
+} ota_password_store_request_t;
+
+/* NVS commits write flash and therefore cannot execute on the PSRAM-backed
+ * HTTPD stack. Keep this tiny persistence operation on an internal-RAM stack,
+ * just as OTA image writes are handled below. */
+static void ota_password_store_worker(void *arg)
 {
+    ota_password_store_request_t *request = (ota_password_store_request_t *)arg;
     nvs_handle_t handle;
-    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_set_str(handle, OTA_NVS_KEY_PASSWORD, pw);
-        nvs_commit(handle);
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, OTA_NVS_KEY_PASSWORD, request->password);
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+        }
         nvs_close(handle);
     }
-    strlcpy(OtaPassword, pw, sizeof(OtaPassword));
+    request->ok = err == ESP_OK;
+    if (request->ok) {
+        strlcpy(OtaPassword, request->password, sizeof(OtaPassword));
+    } else {
+        ESP_LOGE(TAG_WIFI, "OTA password NVS save failed: %s", esp_err_to_name(err));
+    }
+    xSemaphoreGive(request->finished);
+    vTaskDelete(NULL);
+}
+
+static bool ota_password_store(const char *pw)
+{
+    ota_password_store_request_t *request = heap_caps_calloc(
+        1, sizeof(*request), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!request) {
+        return false;
+    }
+    request->finished = xSemaphoreCreateBinary();
+    if (!request->finished) {
+        heap_caps_free(request);
+        return false;
+    }
+    strlcpy(request->password, pw, sizeof(request->password));
+    if (xTaskCreatePinnedToCore(ota_password_store_worker, "ota_pw_save", 4096,
+                                request, 6, NULL, 0) != pdPASS) {
+        vSemaphoreDelete(request->finished);
+        heap_caps_free(request);
+        ESP_LOGE(TAG_WIFI, "OTA password worker could not start");
+        return false;
+    }
+    xSemaphoreTake(request->finished, portMAX_DELAY);
+    bool ok = request->ok;
+    vSemaphoreDelete(request->finished);
+    heap_caps_free(request);
+    return ok;
 }
 
 /* Constant-time-ish compare - avoids an early-exit strcmp() timing signal on
@@ -3315,6 +2868,75 @@ static bool check_ota_auth(httpd_req_t *req)
     return true;
 }
 
+#define OTA_CHUNK_BYTES 512
+typedef struct {
+    size_t len;
+    bool final;
+    bool abort;
+    uint8_t data[OTA_CHUNK_BYTES];
+} ota_chunk_t;
+
+typedef struct {
+    QueueHandle_t chunks;
+    SemaphoreHandle_t finished;
+    size_t image_len;
+    esp_err_t result;
+} ota_session_t;
+
+/* The connected-mode HTTP task runs from PSRAM so its 32 KiB BACnet handler
+ * stack fits. ESP-IDF deliberately forbids flash writes on a PSRAM stack,
+ * because cache is disabled during the write. This worker therefore owns all
+ * esp_ota_* calls and has a small, temporary internal-RAM stack; HTTPD only
+ * receives and queues network data. */
+static void ota_flash_worker(void *arg)
+{
+    ota_session_t *session = (ota_session_t *)arg;
+    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+    esp_ota_handle_t handle = 0;
+    bool begun = false;
+    bool failed = partition == NULL;
+    esp_err_t err = partition ? esp_ota_begin(partition, session->image_len, &handle) : ESP_ERR_NOT_FOUND;
+    if (err == ESP_OK) {
+        begun = true;
+        ESP_LOGI(TAG_WIFI, "OTA: writing %u bytes to partition '%s' at 0x%lx from internal worker",
+                 (unsigned)session->image_len, partition->label, (unsigned long)partition->address);
+    } else {
+        failed = true;
+        ESP_LOGE(TAG_WIFI, "OTA: esp_ota_begin failed: %s", esp_err_to_name(err));
+    }
+
+    for (;;) {
+        ota_chunk_t chunk;
+        if (xQueueReceive(session->chunks, &chunk, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (chunk.abort) {
+            failed = true;
+        } else if (!chunk.final && !failed && esp_ota_write(handle, chunk.data, chunk.len) != ESP_OK) {
+            failed = true;
+            ESP_LOGE(TAG_WIFI, "OTA: esp_ota_write failed");
+        }
+        if (chunk.final) {
+            break;
+        }
+    }
+
+    if (begun && failed) {
+        esp_ota_abort(handle);
+    } else if (begun) {
+        err = esp_ota_end(handle);
+        if (err == ESP_OK) {
+            err = esp_ota_set_boot_partition(partition);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_WIFI, "OTA: image finalization failed: %s", esp_err_to_name(err));
+        }
+    }
+    session->result = failed ? ESP_FAIL : err;
+    xSemaphoreGive(session->finished);
+    vTaskDelete(NULL);
+}
+
 static esp_err_t api_ota_post_handler(httpd_req_t *req)
 {
     if (!check_ota_auth(req)) {
@@ -3326,94 +2948,62 @@ static esp_err_t api_ota_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
-    if (!update_partition) {
+    ota_session_t *session = heap_caps_calloc(1, sizeof(*session), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!session) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-    ESP_LOGI(
-        TAG_WIFI, "OTA: writing %lu bytes to partition '%s' at 0x%lx",
-        (unsigned long)req->content_len, update_partition->label,
-        (unsigned long)update_partition->address);
-
-    /* Held for the whole transfer so a firmware flash and a live BACnet
-       transaction (which shares the same 6s-timeout convention as every
-       other handler here) can never interleave. */
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) != pdTRUE) {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_send(req, "{\"ok\":false,\"error\":\"BACnet busy, try again\"}", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
-    esp_ota_handle_t ota_handle;
-    esp_err_t err = esp_ota_begin(update_partition, req->content_len, &ota_handle);
-    if (err != ESP_OK) {
-        xSemaphoreGive(BacnetMutex);
-        ESP_LOGE(TAG_WIFI, "esp_ota_begin failed: %s", esp_err_to_name(err));
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    char *buf = malloc(2048);
-    if (!buf) {
-        esp_ota_abort(ota_handle);
-        xSemaphoreGive(BacnetMutex);
+    session->chunks = xQueueCreate(2, sizeof(ota_chunk_t));
+    session->finished = xSemaphoreCreateBinary();
+    session->image_len = req->content_len;
+    if (!session->chunks || !session->finished ||
+        xTaskCreatePinnedToCore(ota_flash_worker, "ota_flash", 4096, session, 6, NULL, 0) != pdPASS) {
+        if (session->chunks) vQueueDelete(session->chunks);
+        if (session->finished) vSemaphoreDelete(session->finished);
+        heap_caps_free(session);
+        ESP_LOGE(TAG_WIFI, "OTA: could not start internal flash worker");
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
     size_t remaining = req->content_len;
-    bool write_failed = false;
+    bool receive_failed = false;
     while (remaining > 0) {
-        int to_recv = remaining < 2048 ? (int)remaining : 2048;
-        int recv_len = httpd_req_recv(req, buf, to_recv);
+        ota_chunk_t chunk = {0};
+        int recv_len = httpd_req_recv(req, (char *)chunk.data,
+                                      remaining < OTA_CHUNK_BYTES ? (int)remaining : OTA_CHUNK_BYTES);
         if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
             continue;
         }
         if (recv_len <= 0) {
-            write_failed = true;
+            receive_failed = true;
             break;
         }
-        if (esp_ota_write(ota_handle, buf, recv_len) != ESP_OK) {
-            write_failed = true;
+        chunk.len = (size_t)recv_len;
+        if (xQueueSend(session->chunks, &chunk, pdMS_TO_TICKS(10000)) != pdTRUE) {
+            receive_failed = true;
             break;
         }
-        remaining -= (size_t)recv_len;
+        remaining -= chunk.len;
     }
-    free(buf);
+    ota_chunk_t final_chunk = {.final = true, .abort = receive_failed};
+    xQueueSend(session->chunks, &final_chunk, portMAX_DELAY);
+    xSemaphoreTake(session->finished, portMAX_DELAY);
 
-    if (write_failed) {
-        esp_ota_abort(ota_handle);
-        xSemaphoreGive(BacnetMutex);
-        ESP_LOGE(TAG_WIFI, "OTA: transfer failed with %lu bytes remaining", (unsigned long)remaining);
+    esp_err_t result = session->result;
+    vQueueDelete(session->chunks);
+    vSemaphoreDelete(session->finished);
+    heap_caps_free(session);
+    if (receive_failed || result != ESP_OK) {
+        ESP_LOGE(TAG_WIFI, "OTA: transfer failed with %u bytes remaining", (unsigned)remaining);
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_send(req, "{\"ok\":false,\"error\":\"transfer failed\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
 
-    err = esp_ota_end(ota_handle);
-    if (err != ESP_OK) {
-        xSemaphoreGive(BacnetMutex);
-        ESP_LOGE(TAG_WIFI, "esp_ota_end failed (bad image?): %s", esp_err_to_name(err));
-        httpd_resp_set_status(req, "422 Unprocessable Entity");
-        httpd_resp_send(
-            req, "{\"ok\":false,\"error\":\"image validation failed - not flashed\"}",
-            HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
-    err = esp_ota_set_boot_partition(update_partition);
-    xSemaphoreGive(BacnetMutex);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_WIFI, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
     ESP_LOGW(TAG_WIFI, "OTA: image written and validated, rebooting into it in 2s...");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();
     return ESP_OK;
@@ -3452,15 +3042,15 @@ static esp_err_t wizard_page_get_handler(httpd_req_t *req)
 static const httpd_uri_t wizard_page_uri = {
     .uri = "/wizard", .method = HTTP_GET, .handler = wizard_page_get_handler};
 
-static esp_err_t mqtt_page_get_handler(httpd_req_t *req)
+static esp_err_t smart_home_page_get_handler(httpd_req_t *req)
 {
-    const uint32_t len = mqtt_page_end - mqtt_page_start;
+    const uint32_t len = smart_home_page_end - smart_home_page_start;
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_send(req, mqtt_page_start, len);
+    httpd_resp_send(req, smart_home_page_start, len);
     return ESP_OK;
 }
-static const httpd_uri_t mqtt_page_uri = {
-    .uri = "/mqtt", .method = HTTP_GET, .handler = mqtt_page_get_handler};
+static const httpd_uri_t smart_home_page_uri = {
+    .uri = "/smart-home", .method = HTTP_GET, .handler = smart_home_page_get_handler};
 
 
 
@@ -3489,7 +3079,10 @@ static esp_err_t api_setup_password_post_handler(httpd_req_t *req)
         return ESP_OK; /* check_ota_auth already sent the 401 */
     }
 
-    ota_password_store(pw);
+    if (!ota_password_store(pw)) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     ESP_LOGI(TAG_WIFI, "OTA update password set via setup wizard Step 1");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -3504,6 +3097,13 @@ static void mqtt_publish_discovery(void);
 static void mqtt_unpublish_discovery(void);
 static void mqtt_app_restart(void);
 static void mqtt_app_start(void);
+static void mqtt_app_stop(void);
+static void mqtt_state_task(void *arg);
+
+static bool mqtt_integration_selected(void)
+{
+    return hvac_core_integration_get() == HVAC_INTEGRATION_MQTT_HOME_ASSISTANT;
+}
 
 /* ===================== Object Scanner & Browser APIs ===================== */
 
@@ -3561,9 +3161,23 @@ static uint32_t ScanCurrent = 0;
 static uint32_t ScanTotal = 0;
 static uint8_t ScanPercent = 0;
 static char ScanErrorMsg[64] = {0};
+/* MAX_SCANNED_OBJECTS is a fixed catalog size (PSRAM budget, not an
+ * arbitrary guess), but a real controller can have more objects than that -
+ * without this flag, a scan that stopped early because it hit the cap
+ * reported the same "complete" state as one that saw every object, with no
+ * way to tell the two apart. */
+static volatile bool ScanTruncated = false;
 static TaskHandle_t ScanTaskHandle = NULL;
 static volatile bool ScanTaskFinished = false;
-static StaticTask_t ScanTaskTcb;
+/* Must be heap_caps_calloc'd with MALLOC_CAP_INTERNAL, not a plain static.
+ * A FreeRTOS static task's TCB must always live in internal RAM even though
+ * its stack can be in PSRAM; with CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
+ * enabled for Matter, internal .bss got tight enough that the linker's
+ * automatic .bss-overflow-to-PSRAM fallback swept this plain static struct
+ * into PSRAM, and xTaskCreateStaticPinnedToCore's xPortCheckValidTCBMem()
+ * check aborted with "assert failed" the moment a scan started. Same fix
+ * matter_adapter.cpp already uses for its own sync task's TCB. */
+static StaticTask_t *ScanTaskTcb = NULL;
 static StackType_t *ScanTaskStack = NULL;
 
 /* The commissioning scan is optional and transient. Keep its sizeable stack
@@ -3577,6 +3191,10 @@ static void scan_task_cleanup(void)
     if (ScanTaskStack != NULL) {
         heap_caps_free(ScanTaskStack);
         ScanTaskStack = NULL;
+    }
+    if (ScanTaskTcb != NULL) {
+        heap_caps_free(ScanTaskTcb);
+        ScanTaskTcb = NULL;
     }
     ScanTaskFinished = false;
 }
@@ -3635,6 +3253,7 @@ static void object_scan_task(void *arg)
     ScanPercent = 0;
     ScanTotal = 0;
     ScanErrorMsg[0] = '\0';
+    ScanTruncated = false;
 
     if (!BacnetReady || !EthConnected) {
         ScanState = SCAN_STATE_ERROR;
@@ -3646,13 +3265,11 @@ static void object_scan_task(void *arg)
     }
 
     uint32_t total = 0;
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) == pdTRUE) {
-        BACNET_APPLICATION_DATA_VALUE v = {0};
-        bool ok = bacnet_read_locked_idx(OBJECT_DEVICE, TargetDeviceInstance, PROP_OBJECT_LIST, 0, &v);
-        if (ok && v.tag == BACNET_APPLICATION_TAG_UNSIGNED_INT) {
-            total = v.type.Unsigned_Int;
+    bacnet_response_t resp = {0};
+    if (bacnet_worker_explorer_read_sync(OBJECT_DEVICE, TargetDeviceInstance, PROP_OBJECT_LIST, 0, &resp, 1000) == BACNET_WORKER_STATUS_OK) {
+        if (resp.app_val.tag == BACNET_APPLICATION_TAG_UNSIGNED_INT) {
+            total = resp.app_val.type.Unsigned_Int;
         }
-        xSemaphoreGive(BacnetMutex);
     }
 
     if (total == 0 || total > 2000) {
@@ -3669,28 +3286,22 @@ static void object_scan_task(void *arg)
         uint32_t obj_inst = 0;
         bool got_id = false;
 
-        if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-            BACNET_APPLICATION_DATA_VALUE v = {0};
-            if (bacnet_read_locked_idx(OBJECT_DEVICE, TargetDeviceInstance, PROP_OBJECT_LIST, idx, &v)) {
-                if (v.tag == BACNET_APPLICATION_TAG_OBJECT_ID) {
-                    obj_type = (uint16_t)v.type.Object_Id.type;
-                    obj_inst = v.type.Object_Id.instance;
-                    got_id = true;
-                }
+        memset(&resp, 0, sizeof(resp));
+        if (bacnet_worker_explorer_read_sync(OBJECT_DEVICE, TargetDeviceInstance, PROP_OBJECT_LIST, idx, &resp, 800) == BACNET_WORKER_STATUS_OK) {
+            if (resp.app_val.tag == BACNET_APPLICATION_TAG_OBJECT_ID) {
+                obj_type = (uint16_t)resp.app_val.type.Object_Id.type;
+                obj_inst = resp.app_val.type.Object_Id.instance;
+                got_id = true;
             }
-            xSemaphoreGive(BacnetMutex);
         }
 
         if (got_id) {
             char name_buf[64] = {0};
-            if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-                BACNET_APPLICATION_DATA_VALUE vname = {0};
-                if (bacnet_read_locked((BACNET_OBJECT_TYPE)obj_type, obj_inst, PROP_OBJECT_NAME, &vname)) {
-                    if (vname.tag == BACNET_APPLICATION_TAG_CHARACTER_STRING) {
-                        copy_character_string(name_buf, sizeof(name_buf), (const BACNET_CHARACTER_STRING *)&vname.type.Character_String);
-                    }
+            memset(&resp, 0, sizeof(resp));
+            if (bacnet_worker_explorer_read_sync((BACNET_OBJECT_TYPE)obj_type, obj_inst, PROP_OBJECT_NAME, BACNET_ARRAY_ALL, &resp, 800) == BACNET_WORKER_STATUS_OK) {
+                if (resp.app_val.tag == BACNET_APPLICATION_TAG_CHARACTER_STRING) {
+                    copy_character_string(name_buf, sizeof(name_buf), (const BACNET_CHARACTER_STRING *)&resp.app_val.type.Character_String);
                 }
-                xSemaphoreGive(BacnetMutex);
             }
 
             scanned_object_t *slot = scan_obj(found);
@@ -3714,6 +3325,11 @@ static void object_scan_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
+    if (found >= MAX_SCANNED_OBJECTS && ScanCurrent < total) {
+        ScanTruncated = true;
+        diag_log("object scan hit the %u-object catalog cap with %u of %u objects still unread",
+                 (unsigned)MAX_SCANNED_OBJECTS, (unsigned)(total - ScanCurrent), (unsigned)total);
+    }
     ScanState = SCAN_STATE_COMPLETE;
     ScanTaskFinished = true;
     task_registry_remove_self();
@@ -3764,21 +3380,28 @@ static esp_err_t api_objects_scan_start_handler(httpd_req_t *req)
        task is transient - created per scan, deleted at the end - so this is
        borrowed for the duration of a scan, not held. */
     ScanTaskStack = heap_caps_malloc(24576, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!ScanTaskStack) {
+    ScanTaskTcb = heap_caps_calloc(1, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!ScanTaskStack || !ScanTaskTcb) {
         ScanState = SCAN_STATE_ERROR;
-        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "no PSRAM for scan task");
+        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "no memory for scan task");
+        heap_caps_free(ScanTaskStack);
+        ScanTaskStack = NULL;
+        heap_caps_free(ScanTaskTcb);
+        ScanTaskTcb = NULL;
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"ok\":false,\"error\":\"insufficient PSRAM to start the scan\"}",
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"insufficient memory to start the scan\"}",
                         HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     ScanTaskHandle = xTaskCreateStaticPinnedToCore(
-        object_scan_task, "obj_scan", 24576, NULL, 5, ScanTaskStack, &ScanTaskTcb, tskNO_AFFINITY);
+        object_scan_task, "obj_scan", 24576, NULL, 5, ScanTaskStack, ScanTaskTcb, tskNO_AFFINITY);
     if (!ScanTaskHandle) {
         ScanState = SCAN_STATE_ERROR;
         snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "could not create scan task");
         heap_caps_free(ScanTaskStack);
         ScanTaskStack = NULL;
+        heap_caps_free(ScanTaskTcb);
+        ScanTaskTcb = NULL;
         for (size_t p = 0; p < SCAN_PAGE_COUNT; p++) { heap_caps_free(ScanPages[p]); ScanPages[p] = NULL; }
         ScannedObjectCount = 0;
         diag_log("obj_scan static task create failed - scan aborted");
@@ -3803,9 +3426,10 @@ static esp_err_t api_objects_scan_status_handler(httpd_req_t *req)
 
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "{\"ok\":true,\"state\":\"%s\",\"current\":%u,\"total\":%u,\"percent\":%u,\"count\":%u,\"error\":\"%s\"}",
+             "{\"ok\":true,\"state\":\"%s\",\"current\":%u,\"total\":%u,\"percent\":%u,\"count\":%u,"
+             "\"truncated\":%s,\"error\":\"%s\"}",
              st_str, (unsigned)ScanCurrent, (unsigned)ScanTotal, (unsigned)ScanPercent,
-             (unsigned)ScannedObjectCount, ScanErrorMsg);
+             (unsigned)ScannedObjectCount, ScanTruncated ? "true" : "false", ScanErrorMsg);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -3892,25 +3516,19 @@ static esp_err_t api_objects_inspect_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(4000)) != pdTRUE) {
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"ok\":false,\"error\":\"BACnet mutex busy\"}", HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
     /* 1. Present_Value */
-    BACNET_APPLICATION_DATA_VALUE v = {0};
-    if (bacnet_read_locked(otype, oinst, PROP_PRESENT_VALUE, &v)) {
-        append_value_json(pv_json, sizeof(pv_json), &v);
+    bacnet_response_t resp = {0};
+    if (bacnet_worker_explorer_read_sync(otype, oinst, PROP_PRESENT_VALUE, BACNET_ARRAY_ALL, &resp, 800) == BACNET_WORKER_STATUS_OK) {
+        append_value_json(pv_json, sizeof(pv_json), &resp.app_val);
     }
 
     /* 2. Units - only for Analog objects */
     if (otype == OBJECT_ANALOG_INPUT || otype == OBJECT_ANALOG_OUTPUT || otype == OBJECT_ANALOG_VALUE) {
         vTaskDelay(pdMS_TO_TICKS(10));
-        BACNET_APPLICATION_DATA_VALUE vunits = {0};
-        if (bacnet_read_locked(otype, oinst, PROP_UNITS, &vunits) &&
-            vunits.tag == BACNET_APPLICATION_TAG_ENUMERATED) {
-            const char *uname = bactext_engineering_unit_name_default(vunits.type.Enumerated, "");
+        memset(&resp, 0, sizeof(resp));
+        if (bacnet_worker_explorer_read_sync(otype, oinst, PROP_UNITS, BACNET_ARRAY_ALL, &resp, 800) == BACNET_WORKER_STATUS_OK &&
+            resp.app_val.tag == BACNET_APPLICATION_TAG_ENUMERATED) {
+            const char *uname = bactext_engineering_unit_name_default(resp.app_val.type.Enumerated, "");
             snprintf(units_json, sizeof(units_json), "\"%s\"", uname);
         }
     }
@@ -3918,12 +3536,10 @@ static esp_err_t api_objects_inspect_handler(httpd_req_t *req)
     /* 3. Priority Array - only for actual commandable outputs */
     if (is_commandable_type(otype)) {
         vTaskDelay(pdMS_TO_TICKS(10));
-        static uint8_t raw_copy[MAX_APDU];
-        int raw_len = 0;
-        if (bacnet_read_locked_idx(otype, oinst, PROP_PRIORITY_ARRAY, BACNET_ARRAY_ALL, &v)) {
-            raw_len = Last_Read_Raw_Len;
-            if (raw_len > 0 && raw_len <= (int)sizeof(raw_copy)) {
-                memcpy(raw_copy, Last_Read_Raw, raw_len);
+        memset(&resp, 0, sizeof(resp));
+        if (bacnet_worker_explorer_read_sync(otype, oinst, PROP_PRIORITY_ARRAY, BACNET_ARRAY_ALL, &resp, 800) == BACNET_WORKER_STATUS_OK) {
+            int raw_len = resp.raw_data_len;
+            if (raw_len > 0) {
                 pri_json[0] = '[';
                 pri_json[1] = '\0';
                 size_t pos = 1;
@@ -3932,7 +3548,7 @@ static esp_err_t api_objects_inspect_handler(httpd_req_t *req)
                 while (offset < raw_len && slot < 16 && pos < sizeof(pri_json) - 32) {
                     BACNET_APPLICATION_DATA_VALUE elem = {0};
                     int consumed = bacapp_decode_application_data(
-                        raw_copy + offset, (uint32_t)(raw_len - offset), &elem);
+                        resp.raw_data + offset, (uint32_t)(raw_len - offset), &elem);
                     if (consumed <= 0) break;
                     offset += consumed;
                     if (slot > 0 && pos < sizeof(pri_json) - 32) {
@@ -3951,8 +3567,6 @@ static esp_err_t api_objects_inspect_handler(httpd_req_t *req)
             }
         }
     }
-
-    xSemaphoreGive(BacnetMutex);
 
     char buf[1536];
     snprintf(buf, sizeof(buf),
@@ -4007,46 +3621,43 @@ static esp_err_t api_objects_batch_handler(httpd_req_t *req)
     int count = 0;
     bool truncated = false;
 
-    if (xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(6000)) == pdTRUE) {
-        while (token) {
-            if (count >= BATCH_MAX_POINTS || pos >= BATCH_RESP_BUF - safety_margin) {
-                truncated = true;
-                break;
-            }
-            while (*token == ' ' || *token == '\"' || *token == '[' || *token == ']') token++;
-            char *colon = strchr(token, ':');
-            if (colon) {
-                *colon = '\0';
-                char *tstr = token;
-                char *istr = colon + 1;
-                char *endquote = strpbrk(istr, " \"]");
-                if (endquote) *endquote = '\0';
-
-                BACNET_OBJECT_TYPE otype;
-                if (parse_object_type(tstr, &otype)) {
-                    uint32_t oinst = (uint32_t)strtoul(istr, NULL, 10);
-                    BACNET_APPLICATION_DATA_VALUE v = {0};
-                    bool ok = bacnet_read_locked(otype, oinst, PROP_PRESENT_VALUE, &v);
-
-                    char val_json[48] = "null";
-                    if (ok) {
-                        append_value_json(val_json, sizeof(val_json), &v);
-                    }
-
-                    if (count > 0) {
-                        buf[pos++] = ',';
-                        buf[pos] = '\0';
-                    }
-                    pos += snprintf(buf + pos, BATCH_RESP_BUF - pos,
-                                    "{\"type\":\"%s\",\"instance\":%u,\"valid\":%s,\"value\":%s}",
-                                    tstr, (unsigned)oinst, ok ? "true" : "false", val_json);
-                    count++;
-                }
-            }
-            token = strtok_r(NULL, ",", &saveptr);
-            vTaskDelay(pdMS_TO_TICKS(10));
+    while (token) {
+        if (count >= BATCH_MAX_POINTS || pos >= BATCH_RESP_BUF - safety_margin) {
+            truncated = true;
+            break;
         }
-        xSemaphoreGive(BacnetMutex);
+        while (*token == ' ' || *token == '\"' || *token == '[' || *token == ']') token++;
+        char *colon = strchr(token, ':');
+        if (colon) {
+            *colon = '\0';
+            char *tstr = token;
+            char *istr = colon + 1;
+            char *endquote = strpbrk(istr, " \"]");
+            if (endquote) *endquote = '\0';
+
+            BACNET_OBJECT_TYPE otype;
+            if (parse_object_type(tstr, &otype)) {
+                uint32_t oinst = (uint32_t)strtoul(istr, NULL, 10);
+                bacnet_response_t batch_resp = {0};
+                bool ok = (bacnet_worker_explorer_read_sync(otype, oinst, PROP_PRESENT_VALUE, BACNET_ARRAY_ALL, &batch_resp, 600) == BACNET_WORKER_STATUS_OK);
+
+                char val_json[48] = "null";
+                if (ok) {
+                    append_value_json(val_json, sizeof(val_json), &batch_resp.app_val);
+                }
+
+                if (count > 0) {
+                    buf[pos++] = ',';
+                    buf[pos] = '\0';
+                }
+                pos += snprintf(buf + pos, BATCH_RESP_BUF - pos,
+                                "{\"type\":\"%s\",\"instance\":%u,\"valid\":%s,\"value\":%s}",
+                                tstr, (unsigned)oinst, ok ? "true" : "false", val_json);
+                count++;
+            }
+        }
+        token = strtok_r(NULL, ",", &saveptr);
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     if (pos < BATCH_RESP_BUF - 40) {
@@ -4166,11 +3777,12 @@ static void mqtt_config_load(void)
     }
 }
 
-static void mqtt_config_save(void)
+static bool mqtt_config_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_MQTT_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
     nvs_set_str(handle, "host", MqttBrokerHost);
     nvs_set_u16(handle, "port", MqttBrokerPort);
@@ -4181,8 +3793,14 @@ static void mqtt_config_save(void)
     nvs_set_str(handle, "dev_id", HaDeviceId);
     nvs_set_u8(handle, "disc_en", HaDiscoveryEnabled ? 1 : 0);
     nvs_set_u8(handle, "hlth_en", HaHealthDiscoveryEnabled ? 1 : 0);
-    nvs_commit(handle);
+    esp_err_t err = nvs_commit(handle);
     nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static bool mqtt_config_save(void)
+{
+    return run_internal_flash_op(mqtt_config_save_direct, NULL);
 }
 
 static void custom_mqtt_load(void)
@@ -4223,11 +3841,12 @@ static void custom_mqtt_load(void)
     nvs_close(handle);
 }
 
-static void custom_mqtt_save(void)
+static bool custom_mqtt_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_CUSTOM_MQTT_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
     nvs_set_u8(handle, "count", (uint8_t)CustomMqttCount);
     for (size_t i = 0; i < CustomMqttCount; i++) {
@@ -4250,8 +3869,14 @@ static void custom_mqtt_save(void)
         snprintf(key, sizeof(key), "p%u_en", (unsigned)i);
         nvs_set_u8(handle, key, CustomMqttPoints[i].enabled ? 1 : 0);
     }
-    nvs_commit(handle);
+    esp_err_t err = nvs_commit(handle);
     nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static bool custom_mqtt_save(void)
+{
+    return run_internal_flash_op(custom_mqtt_save_direct, NULL);
 }
 
 static void parse_custom_mqtt_from_json(const char *body)
@@ -4340,17 +3965,24 @@ static void app_config_load(void)
     nvs_close(handle);
 }
 
-static void app_config_save(void)
+static bool app_config_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_APP_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
     nvs_set_u16(handle, NVS_KEY_BOOST_TIMEOUT, BoostTimeoutMinutes);
     nvs_set_u8(handle, NVS_KEY_BOOST_EXTERNAL, BoostRevertExternal ? 1 : 0);
     nvs_set_u8(handle, NVS_KEY_MDNS_ENABLED, MdnsEnabled ? 1 : 0);
-    nvs_commit(handle);
+    esp_err_t err = nvs_commit(handle);
     nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static bool app_config_save(void)
+{
+    return run_internal_flash_op(app_config_save_direct, NULL);
 }
 
 static esp_err_t api_objects_custom_mqtt_get_handler(httpd_req_t *req)
@@ -4437,6 +4069,15 @@ static esp_err_t api_objects_custom_mqtt_post_handler(httpd_req_t *req)
                 break;
             }
         }
+        /* CustomMqttCount == MAX_CUSTOM_MQTT used to silently no-op here
+         * while still returning {"ok":true} below - the UI reported success
+         * for a point that was never actually added. */
+        if (!found && CustomMqttCount >= MAX_CUSTOM_MQTT) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_send(req, "{\"ok\":false,\"error\":\"custom point limit reached (32)\"}",
+                            HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
         if (!found && CustomMqttCount < MAX_CUSTOM_MQTT) {
             strlcpy(CustomMqttPoints[CustomMqttCount].type_str, tstr, sizeof(CustomMqttPoints[CustomMqttCount].type_str));
             CustomMqttPoints[CustomMqttCount].obj_type = (uint16_t)otype;
@@ -4477,141 +4118,17 @@ static esp_err_t api_bacnet_discover_handler(httpd_req_t *req)
     json_get_int(body, "port", &req_port);
     json_get_int(body, "device_id", &req_dev_id);
 
-    if (EthConnected && xSemaphoreTake(BacnetMutex, pdMS_TO_TICKS(8000)) == pdTRUE) {
-        DiscoveredDeviceCount = 0;
-
-        if (strlen(req_ip) > 0) {
-            /* Targeted unicast probe */
-            BACNET_ADDRESS dest = {0};
-            uint16_t nport = req_port > 0 ? (uint16_t)req_port : (TargetPort ? TargetPort : 47808);
-            unsigned a, b, c, d;
-            if (sscanf(req_ip, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
-                dest.mac[0] = (uint8_t)a;
-                dest.mac[1] = (uint8_t)b;
-                dest.mac[2] = (uint8_t)c;
-                dest.mac[3] = (uint8_t)d;
-                memcpy(&dest.mac[4], &nport, 2);
-                dest.mac_len = 6;
-                Send_WhoIs_To_Network(&dest, -1, -1);
-            }
-        } else {
-            /* Full network discovery:
-               1. Global broadcast (255.255.255.255)
-               2. Subnet broadcast (10.0.255.255 & 10.0.3.255)
-               3. Fast unicast sweep across 10.0.3.1 - 10.0.3.32 (and current TargetIp)
-            */
-            Send_WhoIs_Global(-1, -1);
-
-            uint16_t nport = TargetPort ? TargetPort : 47808;
-            BACNET_ADDRESS bcast = {0};
-            bcast.mac[0] = 10; bcast.mac[1] = 0; bcast.mac[2] = 255; bcast.mac[3] = 255;
-            memcpy(&bcast.mac[4], &nport, 2);
-            bcast.mac_len = 6;
-            Send_WhoIs_To_Network(&bcast, -1, -1);
-
-            bcast.mac[2] = 3;
-            Send_WhoIs_To_Network(&bcast, -1, -1);
-
-            /* Sweep 10.0.3.1 to 10.0.3.32 with 15ms pacing between probes */
-            for (unsigned oct = 1; oct <= 32; oct++) {
-                BACNET_ADDRESS udest = {0};
-                udest.mac[0] = 10; udest.mac[1] = 0; udest.mac[2] = 3; udest.mac[3] = (uint8_t)oct;
-                memcpy(&udest.mac[4], &nport, 2);
-                udest.mac_len = 6;
-                Send_WhoIs_To_Network(&udest, -1, -1);
-                vTaskDelay(pdMS_TO_TICKS(15));
-            }
-            /* Also probe current TargetIp if not in 10.0.3.1-32 */
-            unsigned a, b, c, d;
-            if (sscanf(TargetIp, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 && (c != 3 || d > 32)) {
-                BACNET_ADDRESS udest = {0};
-                udest.mac[0] = (uint8_t)a; udest.mac[1] = (uint8_t)b; udest.mac[2] = (uint8_t)c; udest.mac[3] = (uint8_t)d;
-                memcpy(&udest.mac[4], &nport, 2);
-                udest.mac_len = 6;
-                Send_WhoIs_To_Network(&udest, -1, -1);
-            }
-        }
-
-        /* Pump receive loop for 2.0 seconds to capture I-Am replies */
-        int64_t deadline = esp_timer_get_time() + 2000000;
-        while (esp_timer_get_time() < deadline) {
-            uint8_t pdu[BIP_MPDU_MAX] = {0};
-            BACNET_ADDRESS src = {0};
-            uint16_t pdu_len = bip_receive(&src, pdu, sizeof(pdu), 20);
-            if (pdu_len > 0) {
-                npdu_handler(&src, pdu, pdu_len);
-            }
-            vTaskDelay(pdMS_TO_TICKS(15));
-        }
-
-        /* For each discovered device, query device name, vendor name, model name */
-        for (size_t i = 0; i < DiscoveredDeviceCount; i++) {
-            BACNET_APPLICATION_DATA_VALUE v = {0};
-            if (read_real_property(OBJECT_DEVICE, DiscoveredDevices[i].device_id, PROP_OBJECT_NAME, (float *)&v) || true) {
-                /* Try reading object name */
-                BACNET_APPLICATION_DATA_VALUE val = {0};
-                if (bacnet_read_locked(OBJECT_DEVICE, DiscoveredDevices[i].device_id, PROP_OBJECT_NAME, &val) &&
-                    val.tag == BACNET_APPLICATION_TAG_CHARACTER_STRING) {
-                    copy_character_string(DiscoveredDevices[i].name, sizeof(DiscoveredDevices[i].name),
-                                          (const BACNET_CHARACTER_STRING *)&val.type.Character_String);
-                }
-                if (bacnet_read_locked(OBJECT_DEVICE, DiscoveredDevices[i].device_id, PROP_VENDOR_NAME, &val) &&
-                    val.tag == BACNET_APPLICATION_TAG_CHARACTER_STRING) {
-                    copy_character_string(DiscoveredDevices[i].vendor_name, sizeof(DiscoveredDevices[i].vendor_name),
-                                          (const BACNET_CHARACTER_STRING *)&val.type.Character_String);
-                }
-                if (bacnet_read_locked(OBJECT_DEVICE, DiscoveredDevices[i].device_id, PROP_MODEL_NAME, &val) &&
-                    val.tag == BACNET_APPLICATION_TAG_CHARACTER_STRING) {
-                    copy_character_string(DiscoveredDevices[i].model_name, sizeof(DiscoveredDevices[i].model_name),
-                                          (const BACNET_CHARACTER_STRING *)&val.type.Character_String);
-                }
-            }
-        }
-
-        /* Fallback: If no device responded to Who-Is, attempt direct ReadProperty on TargetDeviceInstance */
-        if (DiscoveredDeviceCount == 0) {
-            bind_target_device();
-            BACNET_APPLICATION_DATA_VALUE v = {0};
-            char dname[48] = {0}, vname[48] = {0}, mname[48] = {0};
-            bool direct_ok = false;
-            if (bacnet_read_locked(OBJECT_DEVICE, TargetDeviceInstance, PROP_OBJECT_NAME, &v) &&
-                v.tag == BACNET_APPLICATION_TAG_CHARACTER_STRING) {
-                copy_character_string(dname, sizeof(dname), (const BACNET_CHARACTER_STRING *)&v.type.Character_String);
-                direct_ok = true;
-            }
-            if (bacnet_read_locked(OBJECT_DEVICE, TargetDeviceInstance, PROP_VENDOR_NAME, &v) &&
-                v.tag == BACNET_APPLICATION_TAG_CHARACTER_STRING) {
-                copy_character_string(vname, sizeof(vname), (const BACNET_CHARACTER_STRING *)&v.type.Character_String);
-            }
-            if (bacnet_read_locked(OBJECT_DEVICE, TargetDeviceInstance, PROP_MODEL_NAME, &v) &&
-                v.tag == BACNET_APPLICATION_TAG_CHARACTER_STRING) {
-                copy_character_string(mname, sizeof(mname), (const BACNET_CHARACTER_STRING *)&v.type.Character_String);
-            }
-            if (direct_ok) {
-                DiscoveredDevices[0].device_id = TargetDeviceInstance;
-                strlcpy(DiscoveredDevices[0].ip, TargetIp, sizeof(DiscoveredDevices[0].ip));
-                DiscoveredDevices[0].port = TargetPort;
-                DiscoveredDevices[0].vendor_id = 8;
-                strlcpy(DiscoveredDevices[0].name, dname, sizeof(DiscoveredDevices[0].name));
-                strlcpy(DiscoveredDevices[0].vendor_name, vname[0] ? vname : "Delta Controls", sizeof(DiscoveredDevices[0].vendor_name));
-                strlcpy(DiscoveredDevices[0].model_name, mname[0] ? mname : "DAC Controller", sizeof(DiscoveredDevices[0].model_name));
-                DiscoveredDeviceCount = 1;
-            }
-        }
-
-        /* If at least 1 device discovered, bind the first one as active target */
+    if (EthConnected) {
+        bacnet_worker_discover_sync(DiscoveredDevices, MAX_DISCOVERED_DEVICES, &DiscoveredDeviceCount,
+                                    &DiscoveredDeviceSeenCount, 4000);
         if (DiscoveredDeviceCount > 0) {
             TargetDeviceInstance = DiscoveredDevices[0].device_id;
             strlcpy(TargetIp, DiscoveredDevices[0].ip, sizeof(TargetIp));
             TargetPort = DiscoveredDevices[0].port;
             strlcpy(TargetDeviceName, DiscoveredDevices[0].name, sizeof(TargetDeviceName));
             TargetDeviceNameValid = true;
-            BacnetReady = true;
             target_config_save();
-            bind_target_device();
         }
-
-        xSemaphoreGive(BacnetMutex);
     }
 
     char *buf = malloc(4096);
@@ -4620,7 +4137,9 @@ static esp_err_t api_bacnet_discover_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    size_t off = snprintf(buf, 4096, "{\"ok\":true,\"count\":%u,\"devices\":[", (unsigned)DiscoveredDeviceCount);
+    size_t off = snprintf(buf, 4096, "{\"ok\":true,\"count\":%u,\"truncated\":%s,\"devices\":[",
+                          (unsigned)DiscoveredDeviceCount,
+                          DiscoveredDeviceSeenCount > DiscoveredDeviceCount ? "true" : "false");
     for (size_t i = 0; i < DiscoveredDeviceCount; i++) {
         char name_esc[64] = "", vend_esc[64] = "", mod_esc[64] = "";
         json_escape(name_esc, DiscoveredDevices[i].name, sizeof(name_esc));
@@ -4817,12 +4336,22 @@ static const httpd_uri_t api_rooms_get_uri = {
 
 static esp_err_t api_rooms_post_handler(httpd_req_t *req)
 {
-    char body[1024] = {0};
-    if (!recv_body(req, body, sizeof(body))) {
+    /* A fixed body[1024] silently truncated any payload larger than that
+     * (recv_body has no overflow check) - confirmed live: saving
+     * HVAC_CORE_MAX_ROOMS rooms with realistic name lengths produces a
+     * payload past 1KB, and the tail (the last room) was silently dropped
+     * on write, not rejected. recv_full_body allocates exactly what the
+     * request declares, so this scales with room count/name length instead
+     * of needing a bigger guessed constant that could still be wrong. */
+    char *body = NULL;
+    size_t body_len = 0;
+    if (!recv_full_body(req, &body, &body_len) || !body) {
+        if (body) free(body);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
     parse_rooms_from_json(body);
+    free(body);
     rooms_config_save();
     mqtt_publish_discovery();
 
@@ -4832,6 +4361,161 @@ static esp_err_t api_rooms_post_handler(httpd_req_t *req)
 }
 static const httpd_uri_t api_rooms_post_uri = {
     .uri = "/api/rooms", .method = HTTP_POST, .handler = api_rooms_post_handler};
+
+static esp_err_t api_integration_get_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG_WIFI, "HTTP dispatch GET /api/integration; stack HWM=%u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    hvac_integration_kind_t kind = hvac_core_integration_get();
+    const char *mode_str = "none";
+    if (kind == HVAC_INTEGRATION_MQTT_HOME_ASSISTANT) {
+        mode_str = "mqtt_home_assistant";
+    } else if (kind == HVAC_INTEGRATION_MATTER) {
+        mode_str = "matter";
+    }
+
+    const char *pairing_str = "idle";
+    switch (hvac_core_matter_pairing_get()) {
+    case HVAC_PAIRING_AWAITING: pairing_str = "awaiting_pairing"; break;
+    case HVAC_PAIRING_PAIRED: pairing_str = "paired"; break;
+    case HVAC_PAIRING_TIMED_OUT: pairing_str = "timed_out"; break;
+    default: break;
+    }
+
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"mode\":%d,\"mode_name\":\"%s\",\"matter_supported\":%s,\"mqtt_active\":%s,\"matter_active\":%s,"
+             "\"matter_pairing_status\":\"%s\"}",
+             (int)kind, mode_str,
+#if defined(CONFIG_ENABLE_ESP_MATTER) && CONFIG_ENABLE_ESP_MATTER
+             "true",
+#else
+             "false",
+#endif
+             (kind == HVAC_INTEGRATION_MQTT_HOME_ASSISTANT && MqttConnected) ? "true" : "false",
+             (kind == HVAC_INTEGRATION_MATTER && matter_adapter_is_running()) ? "true" : "false",
+             pairing_str);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+static const httpd_uri_t api_integration_get_uri = {
+    .uri = "/api/integration", .method = HTTP_GET, .handler = api_integration_get_handler};
+
+/* The integration summary is intentionally cheap. The Smart Home page uses
+ * this richer endpoint to ask CHIP for the real, current window state and
+ * the exact onboarding payload being advertised over BLE. */
+static esp_err_t api_matter_setup_get_handler(httpd_req_t *req)
+{
+    matter_onboarding_info_t info;
+    bool ok = matter_adapter_get_onboarding_info(&info);
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":%s,\"running\":%s,\"window_open\":%s,\"paired\":%s,"
+             "\"discriminator\":%u,\"vendor_id\":%u,\"product_id\":%u,"
+             "\"qr_code\":\"%s\",\"manual_code\":\"%s\"}",
+             ok ? "true" : "false", info.running ? "true" : "false",
+             info.window_open ? "true" : "false", info.paired ? "true" : "false", (unsigned)info.discriminator,
+             (unsigned)info.vendor_id, (unsigned)info.product_id,
+             info.qr_code, info.manual_code);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+static const httpd_uri_t api_matter_setup_get_uri = {
+    .uri = "/api/matter/setup", .method = HTTP_GET, .handler = api_matter_setup_get_handler};
+
+static esp_err_t api_matter_retry_pairing_post_handler(httpd_req_t *req)
+{
+    if (hvac_core_integration_get() != HVAC_INTEGRATION_MATTER) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Matter is not the active integration mode\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    bool started = matter_adapter_retry_pairing();
+    if (started) {
+        if (!pairing_store(HVAC_PAIRING_AWAITING)) {
+            started = false;
+        }
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"ok\":%s}", started ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+static const httpd_uri_t api_matter_retry_pairing_uri = {
+    .uri = "/api/matter/retry-pairing", .method = HTTP_POST, .handler = api_matter_retry_pairing_post_handler};
+
+static esp_err_t api_matter_close_pairing_post_handler(httpd_req_t *req)
+{
+    if (hvac_core_integration_get() != HVAC_INTEGRATION_MATTER) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Matter is not the active integration mode\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    bool closed = matter_adapter_close_pairing();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, closed ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+static const httpd_uri_t api_matter_close_pairing_uri = {
+    .uri = "/api/matter/close-pairing", .method = HTTP_POST, .handler = api_matter_close_pairing_post_handler};
+
+static esp_err_t api_integration_post_handler(httpd_req_t *req)
+{
+    char body[256] = {0};
+    if (!recv_body(req, body, sizeof(body))) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+    int mode_val = -1;
+    char mode_str[32] = {0};
+    if (json_get_int(body, "mode", &mode_val)) {
+        /* Int mode parsed */
+    } else if (json_get_str(body, "mode", mode_str, sizeof(mode_str))) {
+        if (strcmp(mode_str, "none") == 0) mode_val = 0;
+        else if (strcmp(mode_str, "mqtt") == 0 || strcmp(mode_str, "mqtt_home_assistant") == 0) mode_val = 1;
+        else if (strcmp(mode_str, "matter") == 0) mode_val = 2;
+    }
+
+    if (mode_val < 0 || mode_val > (int)HVAC_INTEGRATION_MATTER) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Invalid integration mode\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    hvac_integration_kind_t old_mode = hvac_core_integration_get();
+    hvac_integration_kind_t new_mode = (hvac_integration_kind_t)mode_val;
+
+    if (!integration_store(new_mode)) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Failed to save integration mode\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    if (new_mode != old_mode) {
+        if (old_mode == HVAC_INTEGRATION_MQTT_HOME_ASSISTANT) {
+            mqtt_app_stop();
+        } else if (old_mode == HVAC_INTEGRATION_MATTER) {
+            matter_adapter_stop();
+        }
+
+        if (new_mode == HVAC_INTEGRATION_MQTT_HOME_ASSISTANT) {
+            mqtt_app_start();
+            spawn_task(mqtt_state_task, "mqtt_state", 4096, NULL, 5, NULL);
+        } else if (new_mode == HVAC_INTEGRATION_MATTER) {
+            matter_adapter_init();
+            matter_adapter_start();
+        }
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+static const httpd_uri_t api_integration_post_uri = {
+    .uri = "/api/integration", .method = HTTP_POST, .handler = api_integration_post_handler};
 
 static esp_err_t api_mqtt_config_get_handler(httpd_req_t *req)
 {
@@ -4918,7 +4602,7 @@ static esp_err_t api_mqtt_entities_get_handler(httpd_req_t *req)
 
     /* Core 1: System Power */
     bool sys_pwr = false;
-    bool sys_pwr_ok = system_power_commanded(&sys_pwr);
+    bool sys_pwr_ok = BacnetReady && hvac_core_get_system_power_commanded(&sys_pwr);
     len = snprintf(chunk, sizeof(chunk),
                    "%s{\"name\":\"System Power\",\"group\":\"core\",\"type\":\"switch\","
                    "\"unique_id\":\"%s_system_power\",\"topic\":\"%s/system_power/state\","
@@ -5278,8 +4962,15 @@ static const httpd_uri_t api_mqtt_republish_uri = {
 
 static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
 {
-    char body[1536] = {0};
-    if (!recv_body(req, body, sizeof(body))) {
+    /* Carries target + rooms + MQTT config in one payload; a fixed
+     * body[1536] would silently truncate (recv_body has no overflow check,
+     * confirmed live on the same pattern in api_rooms_post_handler above)
+     * once room count/name length push it past that. recv_full_body scales
+     * with the actual request instead of a guessed constant. */
+    char *body = NULL;
+    size_t body_len = 0;
+    if (!recv_full_body(req, &body, &body_len) || !body) {
+        if (body) free(body);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
@@ -5288,6 +4979,11 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
     int tport = 0, tdev = 0;
     if (json_get_str(body, "target_ip", tip, sizeof(tip)) && strlen(tip) > 0) {
         strlcpy(TargetIp, tip, sizeof(TargetIp));
+        /* A manually (re)entered target is unconfirmed until Discover runs
+         * again - carrying over a previous target's confirmed name here
+         * would attach the wrong device's name to this one. */
+        TargetDeviceNameValid = false;
+        TargetDeviceName[0] = '\0';
     }
     if (json_get_int(body, "target_port", &tport) && tport > 0) {
         TargetPort = (uint16_t)tport;
@@ -5296,7 +4992,6 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
         TargetDeviceInstance = (uint32_t)tdev;
     }
     target_config_save();
-    bind_target_device();
 
     parse_rooms_from_json(body);
     rooms_config_save();
@@ -5331,8 +5026,29 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
         HaDiscoveryEnabled = mdisc;
     }
     mqtt_config_save();
-    mqtt_app_start();
+
+    char integ_mode[32] = {0};
+    hvac_integration_kind_t chosen_mode = HVAC_INTEGRATION_MQTT_HOME_ASSISTANT;
+    if (json_get_str(body, "integration_mode", integ_mode, sizeof(integ_mode))) {
+        if (strcmp(integ_mode, "none") == 0) chosen_mode = HVAC_INTEGRATION_NONE;
+        else if (strcmp(integ_mode, "matter") == 0) chosen_mode = HVAC_INTEGRATION_MATTER;
+    }
+    if (!integration_store(chosen_mode)) {
+        free(body);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    /* Only start the transport the user actually selected - each module is
+     * self-contained and must not assume it is the only one configured. */
+    if (chosen_mode == HVAC_INTEGRATION_MQTT_HOME_ASSISTANT) {
+        mqtt_app_start();
+    } else if (chosen_mode == HVAC_INTEGRATION_MATTER) {
+        matter_adapter_init();
+        matter_adapter_start();
+    }
     wizard_completed_save();
+    free(body);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -5501,11 +5217,16 @@ static esp_err_t api_config_import_handler(httpd_req_t *req)
     if (tport <= 0) json_get_int(body, "target_port", &tport);
     if (tdev <= 0) json_get_int(body, "target_device_id", &tdev);
 
-    if (strlen(tip) > 0) strlcpy(TargetIp, tip, sizeof(TargetIp));
+    if (strlen(tip) > 0) {
+        strlcpy(TargetIp, tip, sizeof(TargetIp));
+        /* Same reasoning as the wizard finish handler: a restored/edited
+         * target is unconfirmed until Discover runs again. */
+        TargetDeviceNameValid = false;
+        TargetDeviceName[0] = '\0';
+    }
     if (tport > 0) TargetPort = (uint16_t)tport;
     if (tdev > 0) TargetDeviceInstance = (uint32_t)tdev;
     target_config_save();
-    bind_target_device();
 
     /* 2. WiFi settings */
     char wifi_obj[256] = {0};
@@ -5519,14 +5240,12 @@ static esp_err_t api_config_import_handler(httpd_req_t *req)
         json_get_str(body, "password", w_pass, sizeof(w_pass));
     }
     if (strlen(w_ssid) > 0) {
-        nvs_handle_t whandle;
-        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &whandle) == ESP_OK) {
-            nvs_set_str(whandle, NVS_KEY_SSID, w_ssid);
-            nvs_set_str(whandle, NVS_KEY_PASS, w_pass);
-            nvs_set_u8(whandle, NVS_KEY_WIZARD_DONE, 1);
-            nvs_commit(whandle);
-            nvs_close(whandle);
+        if (save_wifi_credentials(w_ssid, w_pass) == ESP_OK && wizard_completed_save()) {
             has_wifi_update = true;
+        } else {
+            free(body);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
         }
     }
 
@@ -5636,10 +5355,9 @@ static void erase_namespace(const char *ns)
     }
 }
 
-static esp_err_t api_factory_reset_handler(httpd_req_t *req)
+static bool factory_reset_direct(void *arg)
 {
-    mqtt_unpublish_discovery();
-
+    (void)arg;
     erase_namespace(NVS_NAMESPACE);
     erase_namespace(NVS_TARGET_NAMESPACE);
     erase_namespace(NVS_ROOMS_NAMESPACE);
@@ -5647,6 +5365,17 @@ static esp_err_t api_factory_reset_handler(httpd_req_t *req)
     erase_namespace(NVS_CUSTOM_MQTT_NAMESPACE);
     erase_namespace(NVS_APP_NAMESPACE);
     erase_namespace(OTA_NVS_NAMESPACE);
+    hvac_core_integration_reset();
+    return true;
+}
+
+static esp_err_t api_factory_reset_handler(httpd_req_t *req)
+{
+    mqtt_unpublish_discovery();
+    if (!run_internal_flash_op(factory_reset_direct, NULL)) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -5659,6 +5388,31 @@ static const httpd_uri_t api_factory_reset_uri = {
     .uri = "/api/factory-reset", .method = HTTP_POST, .handler = api_factory_reset_handler};
 
 /* ===================== Web Server Life Cycle ===================== */
+
+/* These callbacks are deliberately allocation-free: the Matter profile can
+ * accept TCP connections while its dashboard stops dispatching requests. They
+ * establish whether that failure is before or after HTTPD's session layer. */
+static esp_err_t http_session_open_trace(httpd_handle_t hd, int sockfd)
+{
+    (void)hd;
+    ESP_LOGI(TAG_WIFI, "HTTP session opened fd=%d; stack HWM=%u bytes", sockfd,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    return ESP_OK;
+}
+
+static void http_session_close_trace(httpd_handle_t hd, int sockfd)
+{
+    (void)hd;
+    ESP_LOGI(TAG_WIFI, "HTTP session closed fd=%d", sockfd);
+    /* Setting close_fn hands socket ownership to us: httpd only closes the
+     * socket itself when no close_fn is set (esp_http_server.h). Without
+     * this, every connection leaked one of CONFIG_LWIP_MAX_SOCKETS (16), and
+     * after ~12 new connections accept() failed with ENFILE - existing
+     * keep-alive browser tabs kept working, but no new client could connect
+     * until a power cycle. The fd may already be invalid if the stack closed
+     * it; close() then just fails harmlessly. */
+    close(sockfd);
+}
 
 static esp_err_t api_logs_get_handler(httpd_req_t *req)
 {
@@ -5712,10 +5466,34 @@ static httpd_handle_t start_connected_webserver(void)
        report this task's stack high-water mark so the real margin is
        measurable instead of guessed - tune from that, not from intuition. */
     config.stack_size = CONNECTED_HTTP_STACK_SIZE;
-    config.max_uri_handlers = 55;
+    /* HTTPD needs 32 KiB on this board for the BACnet decode handlers, but at
+     * connected-mode startup the largest internal block is only 14 KiB.  The
+     * task itself has no ISR use; place its stack in PSRAM (enabled by
+     * CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY) and retain internal memory
+     * for Wi-Fi/lwIP and Matter control structures. */
+    config.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    /* ESP-IDF HTTPD defaults to priority 5, the same priority used by the
+     * Matter and BACnet workers. On the live Matter build TCP completed its
+     * handshake but HTTPD never reached its session callback. Keep it one
+     * level above those background workers so dashboard requests are drained
+     * promptly, while Wi-Fi/lwIP still run at their much higher priorities. */
+    config.task_priority = 6;
+    /* Keep the dashboard worker off CPU0, where Wi-Fi/lwIP and the Matter
+     * platform event path run.  On the live Matter image, TCP handshakes
+     * complete but HTTPD's open callback never runs; pinning this independent
+     * select()/handler loop to CPU1 tests scheduler starvation directly. */
+    config.core_id = 1;
+    config.max_uri_handlers = 60;
+    config.open_fn = http_session_open_trace;
+    config.close_fn = http_session_close_trace;
 
     ESP_LOGI(TAG_WIFI, "Starting connected-mode dashboard server on port: '%d'", config.server_port);
-    if (httpd_start(&server, &config) == ESP_OK) {
+    esp_err_t httpd_err = httpd_start(&server, &config);
+    if (httpd_err == ESP_OK) {
+        ESP_LOGI(TAG_WIFI, "Connected-mode HTTPD started (core=%d priority=%u stack=%uB; heap=%uB largest=%uB)",
+                 (int)config.core_id, (unsigned)config.task_priority, (unsigned)config.stack_size,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
         httpd_register_uri_handler(server, &manage_uri);
         httpd_register_uri_handler(server, &status_page_uri);
         httpd_register_uri_handler(server, &health_page_uri);
@@ -5723,7 +5501,7 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &update_page_uri);
         httpd_register_uri_handler(server, &objects_page_uri);
         httpd_register_uri_handler(server, &wizard_page_uri);
-        httpd_register_uri_handler(server, &mqtt_page_uri);
+        httpd_register_uri_handler(server, &smart_home_page_uri);
         httpd_register_uri_handler(server, &api_network_uri);
         httpd_register_uri_handler(server, &api_version_uri);
         httpd_register_uri_handler(server, &api_status_uri);
@@ -5751,6 +5529,11 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &api_strategy_inspect_uri);
         httpd_register_uri_handler(server, &api_rooms_get_uri);
         httpd_register_uri_handler(server, &api_rooms_post_uri);
+        httpd_register_uri_handler(server, &api_integration_get_uri);
+        httpd_register_uri_handler(server, &api_integration_post_uri);
+        httpd_register_uri_handler(server, &api_matter_setup_get_uri);
+        httpd_register_uri_handler(server, &api_matter_retry_pairing_uri);
+        httpd_register_uri_handler(server, &api_matter_close_pairing_uri);
         httpd_register_uri_handler(server, &api_mqtt_config_get_uri);
         httpd_register_uri_handler(server, &api_mqtt_config_post_uri);
         httpd_register_uri_handler(server, &api_mqtt_entities_uri);
@@ -5762,6 +5545,12 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &api_config_export_uri);
         httpd_register_uri_handler(server, &api_config_import_uri);
         httpd_register_uri_handler(server, &api_logs_uri);
+    } else {
+        ESP_LOGE(TAG_WIFI, "Connected-mode HTTPD failed to start: %s (core=%d priority=%u stack=%uB; heap=%uB largest=%uB)",
+                 esp_err_to_name(httpd_err), (int)config.core_id, (unsigned)config.task_priority,
+                 (unsigned)config.stack_size,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
     }
     return server;
 }
@@ -5776,7 +5565,7 @@ static httpd_handle_t start_webserver(void)
     config.max_open_sockets = 8;
     config.lru_purge_enable = true;
     config.stack_size = 24576;
-    config.max_uri_handlers = 25;
+    config.max_uri_handlers = 30;
 
     ESP_LOGI(TAG_WIFI, "Starting server on port: '%d'", config.server_port);
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -5791,6 +5580,11 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &api_strategy_inspect_uri);
         httpd_register_uri_handler(server, &api_rooms_get_uri);
         httpd_register_uri_handler(server, &api_rooms_post_uri);
+        httpd_register_uri_handler(server, &api_integration_get_uri);
+        httpd_register_uri_handler(server, &api_integration_post_uri);
+        httpd_register_uri_handler(server, &api_matter_setup_get_uri);
+        httpd_register_uri_handler(server, &api_matter_retry_pairing_uri);
+        httpd_register_uri_handler(server, &api_matter_close_pairing_uri);
         httpd_register_uri_handler(server, &api_mqtt_config_get_uri);
         httpd_register_uri_handler(server, &api_mqtt_config_post_uri);
         httpd_register_uri_handler(server, &api_mqtt_test_uri);
@@ -6254,7 +6048,7 @@ static void mqtt_publish_room_action(size_t room_idx)
      * is off - only the reported action goes idle, so the room's own on/off
      * setting survives a system-off/on cycle untouched. */
     bool sys_power_commanded = true;
-    system_power_commanded(&sys_power_commanded);
+    hvac_core_get_system_power_commanded(&sys_power_commanded);
     if (!sys_power_commanded) {
         if (MqttClient && MqttConnected) {
             esp_mqtt_client_publish(MqttClient, topic, "idle", 0, 1, true);
@@ -6289,13 +6083,11 @@ static void mqtt_handle_command(const char *topic, const char *data)
     snprintf(match_topic, sizeof(match_topic), "%s/system_power/set", MqttTopicBase);
     if (strcmp(topic, match_topic) == 0) {
         bool on = strcasecmp(data, "ON") == 0 || strcasecmp(data, "1") == 0 || strcasecmp(data, "true") == 0;
-        if (BacnetReady) {
-            write_bool_property(OBJECT_BINARY_VALUE, SYS_POWER_WRITE_INSTANCE, PROP_PRESENT_VALUE, on);
-        }
+        hvac_command_system_power(on);
         snprintf(match_topic, sizeof(match_topic), "%s/system_power/state", MqttTopicBase);
         if (MqttClient && MqttConnected) {
             bool commanded = false;
-            system_power_commanded(&commanded);
+            hvac_core_get_system_power_commanded(&commanded);
             esp_mqtt_client_publish(MqttClient, match_topic, commanded ? "ON" : "OFF", 0, 1, true);
         }
         return;
@@ -6374,18 +6166,13 @@ static void mqtt_handle_command(const char *topic, const char *data)
             if (value > 30.0f) {
                 value = 30.0f;
             }
-            if (BacnetReady) {
-                write_real_property(
-                    OBJECT_ANALOG_VALUE, Rooms[i].setpoint_instance, PROP_PRESENT_VALUE, value);
-            }
+            hvac_command_room_setpoint(i, value, NULL);
             mqtt_republish_real(Rooms[i].setpoint_instance, setpoint_state_topic);
             return;
         }
         if (strcmp(topic, mode_topic) == 0) {
             bool on = (strcasecmp(data, "off") != 0 && strcasecmp(data, "0") != 0 && strcasecmp(data, "false") != 0);
-            if (BacnetReady) {
-                write_bool_property(OBJECT_BINARY_VALUE, Rooms[i].power_instance, PROP_PRESENT_VALUE, on);
-            }
+            hvac_command_room_power(i, on);
             mqtt_republish_bool(Rooms[i].power_instance, mode_state_topic, "heat_cool", "off");
             mqtt_republish_bool(Rooms[i].power_instance, power_state_topic, "ON", "OFF");
             mqtt_publish_room_action(i);
@@ -6393,9 +6180,7 @@ static void mqtt_handle_command(const char *topic, const char *data)
         }
         if (strcmp(topic, power_topic) == 0) {
             bool on = (strcasecmp(data, "ON") == 0 || strcasecmp(data, "1") == 0 || strcasecmp(data, "true") == 0 || strcasecmp(data, "on") == 0);
-            if (BacnetReady) {
-                write_bool_property(OBJECT_BINARY_VALUE, Rooms[i].power_instance, PROP_PRESENT_VALUE, on);
-            }
+            hvac_command_room_power(i, on);
             mqtt_republish_bool(Rooms[i].power_instance, power_state_topic, "ON", "OFF");
             mqtt_republish_bool(Rooms[i].power_instance, mode_state_topic, "heat_cool", "off");
             mqtt_publish_room_action(i);
@@ -6527,8 +6312,27 @@ static void mqtt_app_restart(void)
     }
 }
 
+static void mqtt_app_stop(void)
+{
+    if (MqttClient) {
+        esp_mqtt_client_stop(MqttClient);
+        esp_mqtt_client_destroy(MqttClient);
+        MqttClient = NULL;
+        MqttConnected = false;
+    }
+    if (MqttCommandQueue) {
+        vQueueDelete(MqttCommandQueue);
+        MqttCommandQueue = NULL;
+    }
+    ESP_LOGI(TAG_WIFI, "MQTT integration stopped and resources released");
+}
+
 static void mqtt_app_start(void)
 {
+    if (!mqtt_integration_selected()) {
+        ESP_LOGI(TAG_WIFI, "MQTT integration not selected - resources deferred");
+        return;
+    }
     /* A blank broker means MQTT is not configured. Do not permanently consume
        a 24 KB internal-RAM task stack and queue for an inactive feature. The
        configuration handlers call this function again when a broker is saved,
@@ -6545,7 +6349,7 @@ static void mqtt_app_start(void)
             ESP_LOGE(TAG_WIFI, "MQTT command queue allocation failed");
             return;
         }
-        if (!spawn_task(mqtt_command_task, "mqtt_command", 24576, NULL, 5, NULL)) {
+        if (!spawn_task(mqtt_command_task, "mqtt_command", 4096, NULL, 5, NULL)) {
             vQueueDelete(MqttCommandQueue);
             MqttCommandQueue = NULL;
             return;
@@ -6614,7 +6418,7 @@ static void mqtt_state_task(void *arg)
             int64_t __bacnet_burst_start_us = esp_timer_get_time();
             diag_log("bacnet poll burst start");
             bool sys_power;
-            if (system_power_commanded(&sys_power)) {
+            if (hvac_core_get_system_power_commanded(&sys_power)) {
                 char st_top[96];
                 snprintf(st_top, sizeof(st_top), "%s/system_power/state", MqttTopicBase);
                 esp_mqtt_client_publish(
@@ -6869,12 +6673,27 @@ static void mdns_start_service(void)
         ESP_LOGW(TAG_WIFI, "mDNS init failed - continuing without .local");
         return;
     }
-    mdns_hostname_set(MDNS_HOSTNAME);
+
+    /* Probe before claiming the default name: two bridges on the same LAN
+     * would otherwise both advertise "esp-bacnet-bridge.local" and collide.
+     * One query per candidate name, ESP_ERR_NOT_FOUND means nobody answered
+     * for it - that's the one we take. Capped at 20 suffixes; if even that's
+     * taken, just use the plain default rather than looping forever. */
+    strlcpy(MdnsHostname, MDNS_HOSTNAME, sizeof(MdnsHostname));
+    for (int suffix = 1; suffix <= 20; suffix++) {
+        esp_ip4_addr_t probe_addr;
+        if (mdns_query_a(MdnsHostname, 1000, &probe_addr) == ESP_ERR_NOT_FOUND) {
+            break;
+        }
+        snprintf(MdnsHostname, sizeof(MdnsHostname), "%s-%d", MDNS_HOSTNAME, suffix);
+    }
+
+    mdns_hostname_set(MdnsHostname);
     mdns_instance_name_set("ESP32 BACnet Bridge");
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     MdnsRunning = true;
-    diag_log("mdns advertisement started (%s.local)", MDNS_HOSTNAME);
-    ESP_LOGI(TAG_WIFI, "mDNS ready - reachable at http://%s.local", MDNS_HOSTNAME);
+    diag_log("mdns advertisement started (%s.local)", MdnsHostname);
+    ESP_LOGI(TAG_WIFI, "mDNS ready - reachable at http://%s.local", MdnsHostname);
 }
 
 static void mdns_stop_service(void)
@@ -6902,6 +6721,12 @@ void app_main(void)
 {
     esp_log_set_vprintf(web_log_vprintf);
 
+    /* MdnsHostname lives in PSRAM (EXT_RAM_BSS_ATTR) so it starts zeroed;
+     * give it the sensible default up front so /api/network reports a real
+     * hostname even before/without mdns_start_service() ever running (mDNS
+     * is off by default). */
+    strlcpy(MdnsHostname, MDNS_HOSTNAME, sizeof(MdnsHostname));
+
     ESP_LOGI("MAIN", "=======================================================");
     ESP_LOGI("MAIN", "  ESP32 BACnet Bridge for Delta DAC-1180E Controllers");
     ESP_LOGI("MAIN", "  Created by Piers Wingfield <piers@wingfield.tech>");
@@ -6916,13 +6741,14 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     target_config_load();
     rooms_config_load();
+    hvac_core_integration_load();
     mqtt_config_load();
     custom_mqtt_load();
     app_config_load();
     wizard_completed_load();
     ota_password_load();
-
-    BacnetMutex = xSemaphoreCreateMutex();
+    matter_adapter_set_system_power_handlers(matter_system_power_write, matter_system_power_read);
+    matter_adapter_set_boost_handlers(matter_boost_write, matter_boost_read);
 
     spawn_task(eth_bringup_task, "eth_bringup", 4096, NULL, 5, NULL);
 
@@ -6943,16 +6769,17 @@ void app_main(void)
             /* Advertisement is opt-in and off by default - see NVS_KEY_MDNS_ENABLED.
                Toggleable from the setup wizard and the Update page. */
             mdns_apply_setting();
-            mqtt_app_start();
-            /* 16384, was 24576. Measured via /api/debug/stacks under real
-               workload: peak use 10,356 B, so this leaves ~6 KB of margin and
-               returns 8,192 B to the heap. Deliberately NOT applied to
-               mqtt_command - its measured peak of 752 B is unrepresentative
-               because that task only runs when Home Assistant sends an MQTT
-               command, and its real workload is the BACnet write path.
-               Trimming that one on an unexercised number is exactly how the
-               httpd stack ended up 1,772 B short and crashing. */
-            spawn_task(mqtt_state_task, "mqtt_state", 16384, NULL, 5, NULL);
+            if (hvac_core_integration_get() == HVAC_INTEGRATION_MQTT_HOME_ASSISTANT) {
+                mqtt_app_start();
+                if (mqtt_integration_selected()) {
+                    spawn_task(mqtt_state_task, "mqtt_state", 4096, NULL, 5, NULL);
+                }
+            } else if (hvac_core_integration_get() == HVAC_INTEGRATION_MATTER) {
+                matter_adapter_init();
+                matter_adapter_start();
+            } else {
+                ESP_LOGI(TAG_WIFI, "Integration mode set to NONE (Web Dashboard only)");
+            }
             return;
         }
     } else {

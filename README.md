@@ -126,9 +126,7 @@ in the T-ETH-Lite architecture document.
 
 ## Planned Future Roadmap
 
-- [ ] **Native Apple HomeKit Integration**: Embedded HAP (HomeKit Accessory Protocol) server on the ESP32 for direct pairing with Apple Home without external middleware.
-- [ ] **Native Google Home Integration**: Local Matter / Google Home Local SDK support for direct voice and app control via Google Assistant.
-- [ ] **Native Amazon Alexa Integration**: Direct local Alexa Smart Home Skill integration for native voice control.
+See [`docs/BACKLOG.md`](docs/BACKLOG.md) for planned future work.
 
 ---
 

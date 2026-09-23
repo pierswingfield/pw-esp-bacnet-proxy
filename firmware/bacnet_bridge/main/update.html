@@ -40,12 +40,10 @@
           <a href="/health">Health</a>
         </div>
       </div>
-      <div class="nav-links">
-        <a href="/mqtt">MQTT</a>
-      </div>
       <div>
         <div class="nav-label">Proxy</div>
         <div class="nav-links">
+          <a href="/smart-home">Smart Home</a>
           <a href="/status">Status</a>
           <a href="/reset">Reset</a>
           <a href="/update" class="active">Update</a>
@@ -74,6 +72,17 @@
     <progress id="fwProgress" value="0" max="100"></progress>
     <button type="button" class="danger full-width" id="fwUploadBtn">Upload &amp; Install</button>
     <p class="note" id="fwNote"></p>
+
+    <h2>OTA Password</h2>
+    <p class="note">Change the password used for firmware uploads above and for the Setup Wizard.</p>
+    <label for="otaPwCurrent" class="note" style="display:block; margin:0.6em 0 0.3em;">Current password</label>
+    <input type="password" id="otaPwCurrent" autocomplete="current-password" placeholder="Current OTA password" style="width:100%; box-sizing:border-box; padding:0.55em;">
+    <label for="otaPwNew" class="note" style="display:block; margin:0.6em 0 0.3em;">New password (min 8 characters)</label>
+    <input type="password" id="otaPwNew" autocomplete="new-password" placeholder="New OTA password" style="width:100%; box-sizing:border-box; padding:0.55em;">
+    <label for="otaPwConfirm" class="note" style="display:block; margin:0.6em 0 0.3em;">Confirm new password</label>
+    <input type="password" id="otaPwConfirm" autocomplete="new-password" placeholder="Confirm new OTA password" style="width:100%; box-sizing:border-box; padding:0.55em;">
+    <button type="button" class="full-width" id="otaPwChangeBtn" style="margin-top:0.7em;">Change Password</button>
+    <p class="note" id="otaPwNote"></p>
 
     <h2>Network Discovery (mDNS)</h2>
     <p class="note">
@@ -232,6 +241,56 @@
         xhr.send(input.files[0]);
       });
 
+      // OTA Password change
+      document.getElementById('otaPwChangeBtn').addEventListener('click', function() {
+        var current = document.getElementById('otaPwCurrent').value;
+        var next = document.getElementById('otaPwNew').value;
+        var confirmPw = document.getElementById('otaPwConfirm').value;
+        var note = document.getElementById('otaPwNote');
+        note.style.color = '#555';
+        if (next.length < 8) {
+          note.textContent = 'New password must be at least 8 characters.';
+          note.style.color = '#c0392b';
+          return;
+        }
+        if (next !== confirmPw) {
+          note.textContent = 'New password and confirmation do not match.';
+          note.style.color = '#c0392b';
+          return;
+        }
+        note.textContent = 'Changing password...';
+        var headers = { 'Content-Type': 'application/json' };
+        /* Supplying Basic auth here avoids an unpredictable browser-native
+           credential prompt, same reasoning as the firmware upload above. */
+        if (current) {
+          headers['Authorization'] = 'Basic ' + btoa('admin:' + current);
+        }
+        fetch('/api/setup-password', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({ password: next })
+        }).then(function(r) {
+          if (r.status === 401) {
+            note.textContent = 'Current password is wrong.';
+            note.style.color = '#c0392b';
+            return;
+          }
+          if (!r.ok) {
+            note.textContent = 'Could not change password - try again.';
+            note.style.color = '#c0392b';
+            return;
+          }
+          document.getElementById('otaPwCurrent').value = '';
+          document.getElementById('otaPwNew').value = '';
+          document.getElementById('otaPwConfirm').value = '';
+          note.textContent = 'Password changed.';
+          note.style.color = '#1a7f37';
+        }).catch(function() {
+          note.textContent = 'Request failed - try again.';
+          note.style.color = '#c0392b';
+        });
+      });
+
       // Config Restore
       document.getElementById('cfgRestoreBtn').addEventListener('click', function() {
         var input = document.getElementById('cfgFile');
@@ -287,7 +346,7 @@
     </script>
     <footer style="margin-top: 2.5em; padding-top: 1em; border-top: 1px solid #eee; font-size: 0.75rem; color: #64748b; text-align: center; line-height: 1.5;">
       <span>ESP32 BACnet Bridge · Customised for Delta DAC-1180E systems (West Hampstead Square)</span><br>
-      <span>Created by <a href="mailto:piers@wingfield.tech" style="color: #0284c7; text-decoration: none;">Piers Wingfield</a> · Free &amp; Open Source under MIT License · <a href="https://github.com/pierswingfield/esp-bacnet" target="_blank" style="color: #0284c7; text-decoration: none;">GitHub</a></span>
+      <span>Created by <a href="mailto:piers@wingfield.tech" style="color: #0284c7; text-decoration: none;">Piers Wingfield</a> · Free &amp; Open Source under MIT License · <a href="https://github.com/pierswingfield/pw-esp-bacnet-proxy" target="_blank" style="color: #0284c7; text-decoration: none;">GitHub</a></span>
     </footer>
   </body>
 </html>

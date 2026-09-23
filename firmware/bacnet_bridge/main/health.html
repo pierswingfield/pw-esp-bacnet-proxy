@@ -51,12 +51,10 @@
           <a href="/health" class="active">Health</a>
         </div>
       </div>
-      <div class="nav-links">
-        <a href="/mqtt">MQTT</a>
-      </div>
       <div>
         <div class="nav-label">Proxy</div>
         <div class="nav-links">
+          <a href="/smart-home">Smart Home</a>
           <a href="/status">Status</a>
           <a href="/reset">Reset</a>
           <a href="/update">Update</a>
@@ -73,6 +71,11 @@
       from the controller and is not interpreted. Everything under <em>Interpretation</em> is this
       firmware's guess, produced by generic rules that are <strong>not tuned to your
       installation</strong> — treat it as a starting point for investigation, not a diagnosis.
+    </div>
+
+    <div class="card" id="automationCard" style="display:none;">
+      <h3 style="margin-top:0;">Automation</h3>
+      <div class="row"><span class="label">Mode</span><span class="value" id="autoMode">–</span></div>
     </div>
 
     <h2>Measured <span id="modeBadge" class="tag" style="margin-left:0.5em; font-size:0.8em; font-weight:bold;">–</span></h2>
@@ -282,6 +285,17 @@
         c.appendChild(t);
       }
 
+      function loadIntegrationStatus() {
+        fetch('/api/integration').then(function(r) { return r.json(); }).then(function(res) {
+          if (!res || !res.ok) return;
+          var card = document.getElementById('automationCard');
+          var modeLabels = { none: 'Dashboard Only', mqtt_home_assistant: 'MQTT / Home Assistant', matter: 'Matter' };
+          card.style.display = 'block';
+          document.getElementById('autoMode').textContent = modeLabels[res.mode_name] || res.mode_name;
+
+        }).catch(function() {});
+      }
+
       function load() {
         document.getElementById('staleNote').textContent = 'Loading…';
         fetch('/api/health').then(function(r) { return r.json(); }).then(function(s) {
@@ -368,11 +382,13 @@
       }
 
       document.getElementById('refreshBtn').addEventListener('click', load);
+      document.getElementById('refreshBtn').addEventListener('click', loadIntegrationStatus);
       load();
+      loadIntegrationStatus();
     </script>
     <footer style="margin-top: 2.5em; padding-top: 1em; border-top: 1px solid #eee; font-size: 0.75rem; color: #64748b; text-align: center; line-height: 1.5;">
       <span>ESP32 BACnet Bridge · Customised for Delta DAC-1180E systems (West Hampstead Square)</span><br>
-      <span>Created by <a href="mailto:piers@wingfield.tech" style="color: #0284c7; text-decoration: none;">Piers Wingfield</a> · Free &amp; Open Source under MIT License · <a href="https://github.com/pierswingfield/esp-bacnet" target="_blank" style="color: #0284c7; text-decoration: none;">GitHub</a></span>
+      <span>Created by <a href="mailto:piers@wingfield.tech" style="color: #0284c7; text-decoration: none;">Piers Wingfield</a> · Free &amp; Open Source under MIT License · <a href="https://github.com/pierswingfield/pw-esp-bacnet-proxy" target="_blank" style="color: #0284c7; text-decoration: none;">GitHub</a></span>
     </footer>
   </body>
 </html>
