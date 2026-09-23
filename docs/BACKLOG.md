@@ -30,12 +30,35 @@
 
 ## Matter integration
 
-- **HomeKit multi-device naming**: investigate why adding the device to HomeKit
-  installs as a single "Matter Accessory" tile rather than being split into
-  individual named tiles per object (contradicts earlier assertion this was
-  a Google Home quirk). Determine if HomeKit supports per-object naming or
-  if there's a discovery/configuration path to expose multiple accessories
-  rather than one aggregate device.
+- **Generic "Matter-enabled accessory" label while scanning**: Google Home
+  showed this generic label at the pre-commissioning scan step, unrelated
+  to the per-endpoint names set after pairing. Root-caused via a research
+  pass through connectedhomeip source: `CHIP_DEVICE_CONFIG_DEVICE_VENDOR_NAME`/
+  `_PRODUCT_NAME` only populate the Basic Information cluster's attributes,
+  which a controller can only read *after* commissioning
+  (`GenericDeviceInstanceInfoProvider::GetVendorName/GetProductName`,
+  consumed by `src/app/clusters/basic-information/basic-information.cpp`)
+  - proven by grep, not inferred. The DNS-SD commissionable-node
+  advertisement (what the scan screen actually reads) has its own "DN"
+  (device name) TXT key, populated by `DnssdServer::Advertise()`
+  (`src/app/server/Dnssd.cpp`) only when
+  `CHIP_DEVICE_CONFIG_ENABLE_COMMISSIONABLE_DEVICE_NAME` is set - off by
+  default, and we were never setting it. Fixed in `chip_project_config.h`
+  by enabling that macro and setting `CHIP_DEVICE_CONFIG_DEVICE_NAME`.
+  Unproven: whether Google's scan UI actually renders the `DN` value
+  instead of its fallback string - that's client-side rendering we can't
+  inspect from firmware source; needs a live re-scan to confirm.
+- **HomeKit multi-device tiling**: Google Home already splits our 5 flat
+  sibling endpoints (no Aggregator parent) into separate device cards on
+  its own. Whether HomeKit needs a literal Aggregator endpoint (device
+  type `0x000E`) + per-child `BridgedDeviceBasicInformation` to do the
+  same - the pattern Espressif's own `examples/bridge_apps/zigbee_bridge`
+  uses - is a real, spec-legitimate structural change, but HAP's
+  client-side rendering logic isn't in the connectedhomeip source tree,
+  so the payoff for HomeKit specifically is unproven without live testing
+  on real Apple hardware. Restructuring under an Aggregator would also
+  affect Google Home's current (working) tiling, so treat as a
+  higher-risk change to test in isolation, not a quick fix.
 - **Matter QR code generation**: generate and display the Matter setup QR code
   on the device web UI to simplify HomeKit/Google Home pairing. Needs to
   encode the setup payload and render dynamically on the configuration page.

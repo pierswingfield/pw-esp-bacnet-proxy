@@ -22,6 +22,25 @@
 /* These are the device's Matter Basic Information values. They replace the
  * SDK's TEST_VENDOR / TEST_PRODUCT strings, but do not claim a certified
  * vendor identity: commissioning still uses the development VID/PID until
- * the product is formally certified and provisioned with production DACs. */
+ * the product is formally certified and provisioned with production DACs.
+ * They are read only from the Basic Information cluster's VendorName/
+ * ProductName attributes, which a controller can only fetch after
+ * commissioning (see GenericDeviceInstanceInfoProvider::GetVendorName/
+ * GetProductName in connectedhomeip) - they do NOT reach the DNS-SD
+ * commissionable-node advertisement a controller's app reads while
+ * *scanning*, before pairing. That's a completely separate mechanism,
+ * enabled below. */
 #define CHIP_DEVICE_CONFIG_DEVICE_VENDOR_NAME "Wingfield.tech"
 #define CHIP_DEVICE_CONFIG_DEVICE_PRODUCT_NAME "Home Climate Bridge"
+
+/* The DNS-SD commissionable-node advertisement has its own "DN" (device
+ * name) TXT key, populated by DnssdServer::Advertise() only when this is
+ * enabled (connectedhomeip src/app/server/Dnssd.cpp) - off by default, and
+ * we were never setting it, which is the likely reason Google Home showed
+ * a generic "Matter-enabled accessory" label while scanning: there was no
+ * device name on the wire yet for it to show, not that it deliberately
+ * discarded ours. CHIP_DEVICE_CONFIG_DEVICE_NAME is a separate macro from
+ * VENDOR_NAME/PRODUCT_NAME above (defaults to the SDK's "Test Kitchen").
+ * Max 32 characters per the DN TXT key's spec limit. */
+#define CHIP_DEVICE_CONFIG_ENABLE_COMMISSIONABLE_DEVICE_NAME 1
+#define CHIP_DEVICE_CONFIG_DEVICE_NAME "Home Climate Bridge"
