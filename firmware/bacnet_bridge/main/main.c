@@ -55,6 +55,7 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 #include "esp_netif.h"
+#include "esp_attr.h"
 #include "esp_eth.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -122,6 +123,11 @@ static void mqtt_resume_after_link_up(void);
    state and /api/device/mdns sets it, both of which appear well before the
    mDNS helpers themselves. Off by default - see NVS_KEY_MDNS_ENABLED. */
 #define MDNS_HOSTNAME "esp-bacnet-bridge"
+/* The actually-active hostname: MDNS_HOSTNAME until mdns_start_service()
+ * finds that name already taken on the LAN, at which point it becomes
+ * MDNS_HOSTNAME-1, -2, etc. Two bridges on one network should still both
+ * get a working .local name instead of colliding on the fixed default. */
+static EXT_RAM_BSS_ATTR char MdnsHostname[40];
 static bool MdnsEnabled = false;
 static bool MdnsRunning = false;
 static void mdns_apply_setting(void);
@@ -555,6 +561,23 @@ static void eth_event_handler(
     }
 }
 
+/* Set once by eth_ip_event_handler if DHCP actually assigns an address;
+ * read by the Ethernet bring-up sequence to decide whether to fall back to
+ * the static config below. Not reset afterward - a mid-session DHCP lease
+ * change/renewal is not this bridge's concern, only whether initial
+ * bring-up got an address. */
+static volatile bool EthGotDhcpIp = false;
+
+static void eth_ip_event_handler(
+    void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    if (event_id == IP_EVENT_ETH_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG_BAC, "Ethernet DHCP assigned " IPSTR, IP2STR(&event->ip_info.ip));
+        EthGotDhcpIp = true;
+    }
+}
+
 static inline bool read_real_property(
     BACNET_OBJECT_TYPE object_type, uint32_t object_instance,
     BACNET_PROPERTY_ID property, float *out_value)
@@ -978,21 +1001,46 @@ static void eth_bringup_task(void *arg)
     esp_eth_netif_glue_handle_t glue = esp_eth_new_netif_glue(eth_handles[0]);
     ESP_ERROR_CHECK(esp_netif_attach(EthNetif, glue));
 
-    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(EthNetif));
-    esp_netif_ip_info_t ip_info = {0};
-    ip4addr_aton(LOCAL_STATIC_IP, (ip4_addr_t *)&ip_info.ip);
-    ip4addr_aton(LOCAL_NETMASK, (ip4_addr_t *)&ip_info.netmask);
-    ip4addr_aton(LOCAL_GATEWAY, (ip4_addr_t *)&ip_info.gw);
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(EthNetif, &ip_info));
-    ESP_LOGI(TAG_BAC, "Static IP configured: %s", LOCAL_STATIC_IP);
-
+    /* Try DHCP first rather than assuming this specific static IP is right
+     * for whatever segment this bridge actually ends up on - falls back to
+     * the historical static config below only if nothing answers within a
+     * few seconds. The isolated BACnet segment this bridge targets
+     * typically runs no DHCP server (part of why it's isolated), so this
+     * usually times out and costs a few seconds of boot; a differently
+     * set up segment that does run DHCP now gets a correct address
+     * instead of silently colliding with or missing this hardcoded one. */
     ESP_ERROR_CHECK(
         esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &eth_ip_event_handler, NULL));
     ESP_ERROR_CHECK(esp_eth_start(eth_handles[0]));
 
     ESP_LOGI(TAG_BAC, "Waiting for Ethernet link...");
     while (!EthConnected) {
         vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    ESP_LOGI(TAG_BAC, "Link up - waiting up to 5s for DHCP...");
+    for (int waited_ms = 0; waited_ms < 5000 && !EthGotDhcpIp; waited_ms += 200) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    if (EthGotDhcpIp) {
+        esp_netif_ip_info_t dhcp_info = {0};
+        esp_netif_get_ip_info(EthNetif, &dhcp_info);
+        char dhcp_ip_str[16];
+        esp_ip4addr_ntoa(&dhcp_info.ip, dhcp_ip_str, sizeof(dhcp_ip_str));
+        ESP_LOGI(TAG_BAC, "DHCP IP configured: %s", dhcp_ip_str);
+        diag_log("eth DHCP assigned %s", dhcp_ip_str);
+    } else {
+        ESP_LOGI(TAG_BAC, "No DHCP response - falling back to static IP");
+        ESP_ERROR_CHECK(esp_netif_dhcpc_stop(EthNetif));
+        esp_netif_ip_info_t ip_info = {0};
+        ip4addr_aton(LOCAL_STATIC_IP, (ip4_addr_t *)&ip_info.ip);
+        ip4addr_aton(LOCAL_NETMASK, (ip4_addr_t *)&ip_info.netmask);
+        ip4addr_aton(LOCAL_GATEWAY, (ip4_addr_t *)&ip_info.gw);
+        ESP_ERROR_CHECK(esp_netif_set_ip_info(EthNetif, &ip_info));
+        ESP_LOGI(TAG_BAC, "Static IP configured: %s", LOCAL_STATIC_IP);
     }
 
     ping_test();
@@ -1738,7 +1786,7 @@ static esp_err_t api_network_get_handler(httpd_req_t *req)
         StaSsid, StaIp, rssi_json, EthConnected ? "true" : "false", name_json, TargetIp,
         (long long)uptime_s, reset_reason, reset_is_power_issue ? "true" : "false",
         ota_password_is_set() ? "true" : "false",
-        MdnsEnabled ? "true" : "false", MDNS_HOSTNAME);
+        MdnsEnabled ? "true" : "false", MdnsHostname);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, off);
@@ -2553,7 +2601,7 @@ static esp_err_t api_device_mdns_post_handler(httpd_req_t *req)
     char resp[96];
     snprintf(resp, sizeof(resp),
              "{\"ok\":true,\"mdns_enabled\":%s,\"hostname\":\"%s.local\"}",
-             MdnsEnabled ? "true" : "false", MDNS_HOSTNAME);
+             MdnsEnabled ? "true" : "false", MdnsHostname);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -6617,12 +6665,27 @@ static void mdns_start_service(void)
         ESP_LOGW(TAG_WIFI, "mDNS init failed - continuing without .local");
         return;
     }
-    mdns_hostname_set(MDNS_HOSTNAME);
+
+    /* Probe before claiming the default name: two bridges on the same LAN
+     * would otherwise both advertise "esp-bacnet-bridge.local" and collide.
+     * One query per candidate name, ESP_ERR_NOT_FOUND means nobody answered
+     * for it - that's the one we take. Capped at 20 suffixes; if even that's
+     * taken, just use the plain default rather than looping forever. */
+    strlcpy(MdnsHostname, MDNS_HOSTNAME, sizeof(MdnsHostname));
+    for (int suffix = 1; suffix <= 20; suffix++) {
+        esp_ip4_addr_t probe_addr;
+        if (mdns_query_a(MdnsHostname, 1000, &probe_addr) == ESP_ERR_NOT_FOUND) {
+            break;
+        }
+        snprintf(MdnsHostname, sizeof(MdnsHostname), "%s-%d", MDNS_HOSTNAME, suffix);
+    }
+
+    mdns_hostname_set(MdnsHostname);
     mdns_instance_name_set("ESP32 BACnet Bridge");
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     MdnsRunning = true;
-    diag_log("mdns advertisement started (%s.local)", MDNS_HOSTNAME);
-    ESP_LOGI(TAG_WIFI, "mDNS ready - reachable at http://%s.local", MDNS_HOSTNAME);
+    diag_log("mdns advertisement started (%s.local)", MdnsHostname);
+    ESP_LOGI(TAG_WIFI, "mDNS ready - reachable at http://%s.local", MdnsHostname);
 }
 
 static void mdns_stop_service(void)
@@ -6649,6 +6712,12 @@ static void mdns_apply_setting(void)
 void app_main(void)
 {
     esp_log_set_vprintf(web_log_vprintf);
+
+    /* MdnsHostname lives in PSRAM (EXT_RAM_BSS_ATTR) so it starts zeroed;
+     * give it the sensible default up front so /api/network reports a real
+     * hostname even before/without mdns_start_service() ever running (mDNS
+     * is off by default). */
+    strlcpy(MdnsHostname, MDNS_HOSTNAME, sizeof(MdnsHostname));
 
     ESP_LOGI("MAIN", "=======================================================");
     ESP_LOGI("MAIN", "  ESP32 BACnet Bridge for Delta DAC-1180E Controllers");

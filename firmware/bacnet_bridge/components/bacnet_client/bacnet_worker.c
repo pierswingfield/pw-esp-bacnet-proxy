@@ -474,18 +474,44 @@ static void execute_worker_discovery(bacnet_request_t *req, bacnet_response_t *r
     Send_WhoIs_Global(-1, -1);
 
     uint16_t nport = s_target_port ? s_target_port : 47808;
+
+    /* Derive the unicast sweep range from the bridge's own live IP instead
+     * of a hardcoded subnet - this used to always scan 10.0.3.1-32
+     * regardless of what the bridge was actually configured with, which
+     * only worked because every deployment so far has used that exact
+     * convention. A global Who-Is (above) reaches every listener anyway,
+     * but some BACnet/IP stacks are configured not to answer broadcast
+     * Who-Is, so the unicast sweep of the bridge's own /24-equivalent
+     * slice still matters - it just needs to be the *actual* slice, not
+     * an assumed one. Falls back to the historical 10.0.3.x range only if
+     * the netif has no IP yet (shouldn't happen in normal operation, since
+     * discovery is only reachable once Ethernet is up). */
+    unsigned net_o1 = 10, net_o2 = 0, net_o3 = 3;
+    esp_netif_ip_info_t ip_info = {0};
+    if (s_netif && esp_netif_get_ip_info(s_netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+        char ip_str[16];
+        esp_ip4addr_ntoa(&ip_info.ip, ip_str, sizeof(ip_str));
+        unsigned o1, o2, o3, o4;
+        if (sscanf(ip_str, "%u.%u.%u.%u", &o1, &o2, &o3, &o4) == 4) {
+            net_o1 = o1;
+            net_o2 = o2;
+            net_o3 = o3;
+        }
+    }
+
     BACNET_ADDRESS bcast = {0};
-    bcast.mac[0] = 10; bcast.mac[1] = 0; bcast.mac[2] = 255; bcast.mac[3] = 255;
+    bcast.mac[0] = (uint8_t)net_o1; bcast.mac[1] = (uint8_t)net_o2; bcast.mac[2] = 255; bcast.mac[3] = 255;
     memcpy(&bcast.mac[4], &nport, 2);
     bcast.mac_len = 6;
     Send_WhoIs_To_Network(&bcast, -1, -1);
 
-    bcast.mac[2] = 3;
+    bcast.mac[2] = (uint8_t)net_o3;
     Send_WhoIs_To_Network(&bcast, -1, -1);
 
     for (unsigned oct = 1; oct <= 32; oct++) {
         BACNET_ADDRESS udest = {0};
-        udest.mac[0] = 10; udest.mac[1] = 0; udest.mac[2] = 3; udest.mac[3] = (uint8_t)oct;
+        udest.mac[0] = (uint8_t)net_o1; udest.mac[1] = (uint8_t)net_o2; udest.mac[2] = (uint8_t)net_o3;
+        udest.mac[3] = (uint8_t)oct;
         memcpy(&udest.mac[4], &nport, 2);
         udest.mac_len = 6;
         Send_WhoIs_To_Network(&udest, -1, -1);
