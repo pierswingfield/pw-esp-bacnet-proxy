@@ -540,7 +540,10 @@ static esp_netif_t *EthNetif = NULL;
 
 #define BacnetReady (bacnet_worker_is_ready())
 
-static bacnet_discovered_dev_t DiscoveredDevices[MAX_DISCOVERED_DEVICES];
+/* ~1.3KB (8 * ~168B struct) - moved to PSRAM to buy back internal DRAM
+ * headroom; this array is only touched from the (rare, user-initiated)
+ * discovery flow, never from a hot path. */
+static EXT_RAM_BSS_ATTR bacnet_discovered_dev_t DiscoveredDevices[MAX_DISCOVERED_DEVICES];
 static size_t DiscoveredDeviceCount = 0;
 static size_t DiscoveredDeviceSeenCount = 0;
 
