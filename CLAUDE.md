@@ -11,6 +11,19 @@
 - Keep only one bridge on the isolated `10.0.3.x` BACnet segment at a time:
   both profiles use the same static address.
 
+## Networks and devices
+
+- The bridge sits on two separate LANs, which is why it has two network
+  interfaces: Wi-Fi joins the home LAN (`192.168.1.x`: web UI, OTA, MQTT,
+  Matter), and Ethernet sits on the isolated BACnet segment (`10.0.3.x`) with
+  the controller. The two are not routed to each other, so BACnet traffic
+  never touches the home LAN and the bridge's `10.0.3.x` address is not
+  reachable from the home LAN.
+- **Test device:** `192.168.1.44` on the home LAN. Flash it via LAN OTA
+  (Update page) and verify it over HTTP there.
+- **Production device:** runs the `master` branch. Do not flash or test
+  against it.
+
 ## Build and verification
 
 Source ESP-IDF 5.3.1 before building. The normal T-ETH-Lite command is:
