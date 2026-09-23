@@ -4262,12 +4262,22 @@ static const httpd_uri_t api_rooms_get_uri = {
 
 static esp_err_t api_rooms_post_handler(httpd_req_t *req)
 {
-    char body[1024] = {0};
-    if (!recv_body(req, body, sizeof(body))) {
+    /* A fixed body[1024] silently truncated any payload larger than that
+     * (recv_body has no overflow check) - confirmed live: saving
+     * HVAC_CORE_MAX_ROOMS rooms with realistic name lengths produces a
+     * payload past 1KB, and the tail (the last room) was silently dropped
+     * on write, not rejected. recv_full_body allocates exactly what the
+     * request declares, so this scales with room count/name length instead
+     * of needing a bigger guessed constant that could still be wrong. */
+    char *body = NULL;
+    size_t body_len = 0;
+    if (!recv_full_body(req, &body, &body_len) || !body) {
+        if (body) free(body);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
     parse_rooms_from_json(body);
+    free(body);
     rooms_config_save();
     mqtt_publish_discovery();
 
@@ -4878,8 +4888,15 @@ static const httpd_uri_t api_mqtt_republish_uri = {
 
 static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
 {
-    char body[1536] = {0};
-    if (!recv_body(req, body, sizeof(body))) {
+    /* Carries target + rooms + MQTT config in one payload; a fixed
+     * body[1536] would silently truncate (recv_body has no overflow check,
+     * confirmed live on the same pattern in api_rooms_post_handler above)
+     * once room count/name length push it past that. recv_full_body scales
+     * with the actual request instead of a guessed constant. */
+    char *body = NULL;
+    size_t body_len = 0;
+    if (!recv_full_body(req, &body, &body_len) || !body) {
+        if (body) free(body);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
@@ -4943,6 +4960,7 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
         else if (strcmp(integ_mode, "matter") == 0) chosen_mode = HVAC_INTEGRATION_MATTER;
     }
     if (!integration_store(chosen_mode)) {
+        free(body);
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
@@ -4956,6 +4974,7 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
         matter_adapter_start();
     }
     wizard_completed_save();
+    free(body);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
