@@ -363,6 +363,23 @@ esp_err_t matter_adapter_init(void)
         return ESP_FAIL;
     }
 
+    /* EXPERIMENTAL: nest every endpoint under an Aggregator (device type
+     * 0x000E), following the pattern Espressif's own zigbee_bridge example
+     * uses (examples/bridge_apps/zigbee_bridge). Google Home already splits
+     * our flat sibling endpoints into separate cards without this; this is
+     * specifically to test whether HomeKit needs the literal Aggregator +
+     * PartsList structure to do the same (see docs/BACKLOG.md). The
+     * Descriptor cluster's PartsList is computed dynamically by walking
+     * each endpoint's parent (connectedhomeip src/app/clusters/descriptor/
+     * descriptor.cpp, emberAfParentEndpointFromIndex) - set_parent_endpoint()
+     * below is the only wiring needed, nothing to populate by hand. */
+    aggregator::config_t aggregator_config;
+    endpoint_t *aggregator_ep = aggregator::create(s_node, &aggregator_config, ENDPOINT_FLAG_NONE, nullptr);
+    if (aggregator_ep == nullptr) {
+        ESP_LOGE(TAG, "Failed to create Matter aggregator endpoint");
+        return ESP_FAIL;
+    }
+
     /* The system endpoint is a plain OnOff switch, not a thermostat: there
      * is no home-level temperature control or mode, only whether the plant
      * is allowed to run. It is deliberately separate from rooms - a room's
@@ -376,6 +393,7 @@ esp_err_t matter_adapter_init(void)
     }
     s_system_endpoint_id = endpoint::get_id(system_ep);
     set_bridged_node_label(system_ep, "Home Cooling System");
+    set_parent_endpoint(system_ep, aggregator_ep);
 
     /* Boost Heat/Boost Cool: two more plain OnOff switches, same shape as
      * the system switch above. Their config/create calls are on the stack
@@ -392,6 +410,7 @@ esp_err_t matter_adapter_init(void)
     }
     s_boost_heat_endpoint_id = endpoint::get_id(boost_heat_ep);
     set_bridged_node_label(boost_heat_ep, "Boost Heat");
+    set_parent_endpoint(boost_heat_ep, aggregator_ep);
 
     on_off_plugin_unit::config_t boost_cool_config;
     boost_cool_config.on_off.on_off = false;
@@ -402,6 +421,7 @@ esp_err_t matter_adapter_init(void)
     }
     s_boost_cool_endpoint_id = endpoint::get_id(boost_cool_ep);
     set_bridged_node_label(boost_cool_ep, "Boost Cool");
+    set_parent_endpoint(boost_cool_ep, aggregator_ep);
 
     /* 8*40B of internal .bss overflowed this board's tight internal DRAM
      * budget by 280B at link time; this buffer only needs to outlive the
@@ -429,6 +449,7 @@ esp_err_t matter_adapter_init(void)
             return ESP_FAIL;
         }
         s_room_endpoint_ids[i] = endpoint::get_id(room_ep);
+        set_parent_endpoint(room_ep, aggregator_ep);
         ++created_rooms;
         ESP_LOGI(TAG, "Matter room endpoint %u created for %s", s_room_endpoint_ids[i], room->name);
     }
