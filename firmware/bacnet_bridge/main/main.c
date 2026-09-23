@@ -199,6 +199,53 @@ static bool spawn_task(
     return false;
 }
 
+/* Connected-mode HTTPD deliberately uses a PSRAM stack for its large BACnet
+ * handlers. Flash cache is disabled during NVS and OTA writes, so those writes
+ * must never run on that task. Submit short persistence operations here; they
+ * execute synchronously on a temporary internal-RAM stack and propagate their
+ * result back to the caller. */
+typedef bool (*internal_flash_op_t)(void *arg);
+typedef struct {
+    internal_flash_op_t op;
+    void *arg;
+    SemaphoreHandle_t finished;
+    bool ok;
+} internal_flash_request_t;
+
+static void internal_flash_worker(void *arg)
+{
+    internal_flash_request_t *request = (internal_flash_request_t *)arg;
+    request->ok = request->op(request->arg);
+    xSemaphoreGive(request->finished);
+    vTaskDelete(NULL);
+}
+
+static bool run_internal_flash_op(internal_flash_op_t op, void *arg)
+{
+    internal_flash_request_t *request = heap_caps_calloc(
+        1, sizeof(*request), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!request) return false;
+    request->finished = xSemaphoreCreateBinary();
+    if (!request->finished) {
+        heap_caps_free(request);
+        return false;
+    }
+    request->op = op;
+    request->arg = arg;
+    if (xTaskCreatePinnedToCore(internal_flash_worker, "flash_store", 4096,
+                                request, 6, NULL, 0) != pdPASS) {
+        vSemaphoreDelete(request->finished);
+        heap_caps_free(request);
+        ESP_LOGE("MAIN", "internal flash worker could not start");
+        return false;
+    }
+    xSemaphoreTake(request->finished, portMAX_DELAY);
+    bool ok = request->ok;
+    vSemaphoreDelete(request->finished);
+    heap_caps_free(request);
+    return ok;
+}
+
 /* ===================== In-Memory Web Log Buffer ===================== */
 /* Halved from 16384 on 2026-08-25. This is a plain static ring buffer for
    /api/logs; 8K still holds a useful scrollback and returns 8K of DRAM to a
@@ -264,7 +311,12 @@ static bool BoostSelfInitiated = false;
 static int64_t BoostDeadlineUs = 0;
 
 static bool boost_apply(unsigned mode, bool self_initiated);
-static void app_config_save(void);
+static bool app_config_save(void);
+
+static bool matter_system_power_write(bool on);
+static bool matter_system_power_read(bool *out_on);
+static bool matter_boost_write(matter_boost_target_t target, bool on);
+static bool matter_boost_read(matter_system_mode_t *out_mode);
 
 static int boost_remaining_minutes(void)
 {
@@ -288,6 +340,9 @@ typedef hvac_room_config_t room_config_t;
 #define NVS_TARGET_NAMESPACE "nvs_target"
 #define NVS_ROOMS_NAMESPACE "nvs_rooms"
 
+static char TargetDeviceName[MAX_CHARACTER_STRING_BYTES + 1] = {0};
+static volatile bool TargetDeviceNameValid = false;
+
 static void target_config_load(void)
 {
     nvs_handle_t handle;
@@ -298,22 +353,42 @@ static void target_config_load(void)
     nvs_get_str(handle, "ip", TargetIp, &ip_len);
     nvs_get_u16(handle, "port", &TargetPort);
     nvs_get_u32(handle, "dev_id", &TargetDeviceInstance);
+    /* Discovery confirms the target's self-reported name once, interactively
+     * (see api_bacnet_discover_handler); without persisting it, the status
+     * page reverted to "Not confirmed yet" on every reboot even though the
+     * target itself (ip/port/dev_id above) was correctly configured and
+     * responding the whole time. */
+    size_t name_len = sizeof(TargetDeviceName);
+    if (nvs_get_str(handle, "name", TargetDeviceName, &name_len) == ESP_OK && TargetDeviceName[0] != '\0') {
+        TargetDeviceNameValid = true;
+    }
     nvs_close(handle);
     bacnet_worker_set_target(TargetDeviceInstance, TargetIp, TargetPort);
 }
 
-static void target_config_save(void)
+static bool target_config_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_TARGET_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
-    nvs_set_str(handle, "ip", TargetIp);
-    nvs_set_u16(handle, "port", TargetPort);
-    nvs_set_u32(handle, "dev_id", TargetDeviceInstance);
-    nvs_commit(handle);
+    esp_err_t err = nvs_set_str(handle, "ip", TargetIp);
+    if (err == ESP_OK) err = nvs_set_u16(handle, "port", TargetPort);
+    if (err == ESP_OK) err = nvs_set_u32(handle, "dev_id", TargetDeviceInstance);
+    if (err == ESP_OK && TargetDeviceNameValid) {
+        err = nvs_set_str(handle, "name", TargetDeviceName);
+    }
+    if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
+    if (err != ESP_OK) return false;
     bacnet_worker_set_target(TargetDeviceInstance, TargetIp, TargetPort);
+    return true;
+}
+
+static bool target_config_save(void)
+{
+    return run_internal_flash_op(target_config_save_direct, NULL);
 }
 
 static void rooms_config_load(void)
@@ -321,9 +396,52 @@ static void rooms_config_load(void)
     hvac_core_rooms_load();
 }
 
-static void rooms_config_save(void)
+static bool rooms_config_save_direct(void *arg)
 {
+    (void)arg;
     hvac_core_rooms_save();
+    return true;
+}
+
+static bool rooms_config_save(void)
+{
+    return run_internal_flash_op(rooms_config_save_direct, NULL);
+}
+
+typedef struct {
+    hvac_integration_kind_t kind;
+    bool result;
+} integration_store_request_t;
+
+static bool integration_store_direct(void *arg)
+{
+    integration_store_request_t *request = (integration_store_request_t *)arg;
+    request->result = hvac_core_integration_set(request->kind);
+    return request->result;
+}
+
+static bool integration_store(hvac_integration_kind_t kind)
+{
+    integration_store_request_t request = {.kind = kind, .result = false};
+    return run_internal_flash_op(integration_store_direct, &request) && request.result;
+}
+
+typedef struct {
+    hvac_pairing_status_t status;
+    bool result;
+} pairing_store_request_t;
+
+static bool pairing_store_direct(void *arg)
+{
+    pairing_store_request_t *request = (pairing_store_request_t *)arg;
+    request->result = hvac_core_matter_pairing_set(request->status);
+    return request->result;
+}
+
+static bool pairing_store(hvac_pairing_status_t status)
+{
+    pairing_store_request_t request = {.status = status, .result = false};
+    return run_internal_flash_op(pairing_store_direct, &request) && request.result;
 }
 
 
@@ -415,8 +533,6 @@ static volatile bool EthConnected = false;
 static esp_netif_t *EthNetif = NULL;
 
 #define BacnetReady (bacnet_worker_is_ready())
-static char TargetDeviceName[MAX_CHARACTER_STRING_BYTES + 1] = {0};
-static volatile bool TargetDeviceNameValid = false;
 
 static bacnet_discovered_dev_t DiscoveredDevices[MAX_DISCOVERED_DEVICES];
 static size_t DiscoveredDeviceCount = 0;
@@ -478,6 +594,55 @@ static inline bool write_msv_property(
     BACNET_PROPERTY_ID property, unsigned value)
 {
     return bacnet_worker_write_msv(object_type, object_instance, property, value);
+}
+
+/* Matter's system endpoint is a plain OnOff switch: there is no home-level
+ * temperature control or mode, only whether the plant is allowed to run.
+ * Boost Heat/Boost Cool are BACnet-level plant commands (see boost_apply()
+ * above) and are intentionally not reachable from Matter - only from the
+ * web UI/API - so this never touches boost state. */
+static bool matter_system_power_write(bool on)
+{
+    return hvac_core_set_system_power(on);
+}
+
+static bool matter_system_power_read(bool *out_on)
+{
+    if (!out_on) return false;
+    return hvac_core_get_system_power_commanded(out_on);
+}
+
+/* Two OnOff switches ("Boost Heat"/"Boost Cool") over one tri-state BACnet
+ * boost mode. Mutual exclusion lives here, not in matter_adapter: turning a
+ * switch on selects that boost; turning the currently-active one off
+ * returns to Auto (no boost). Turning off the inactive switch is a no-op -
+ * matter_adapter never reports it as on in the first place, so a genuine
+ * write there would mean a stale controller cache, not a real request. */
+static bool matter_boost_write(matter_boost_target_t target, bool on)
+{
+    unsigned mode = on
+        ? (target == MATTER_BOOST_TARGET_HEAT ? BOOST_MODE_FULL_HEATING : BOOST_MODE_FULL_COOLING)
+        : BOOST_MODE_AUTO;
+    return boost_apply(mode, true);
+}
+
+static bool matter_boost_read(matter_system_mode_t *out_mode)
+{
+    if (!out_mode) return false;
+    unsigned boost_mode = BOOST_MODE_AUTO;
+    if (BacnetReady && read_msv_property(OBJECT_MULTI_STATE_VALUE, BOOST_INSTANCE,
+                                         PROP_PRESENT_VALUE, &boost_mode)) {
+        if (boost_mode == BOOST_MODE_FULL_HEATING) {
+            *out_mode = MATTER_SYSTEM_MODE_HEAT;
+            return true;
+        }
+        if (boost_mode == BOOST_MODE_FULL_COOLING) {
+            *out_mode = MATTER_SYSTEM_MODE_COOL;
+            return true;
+        }
+    }
+    *out_mode = MATTER_SYSTEM_MODE_AUTO;
+    return true;
 }
 
 /* ===================== Protocol-neutral HVAC commands ===================== */
@@ -886,8 +1051,8 @@ extern const char objects_page_start[] asm("_binary_objects_html_start");
 extern const char objects_page_end[] asm("_binary_objects_html_end");
 extern const char wizard_page_start[] asm("_binary_wizard_html_start");
 extern const char wizard_page_end[] asm("_binary_wizard_html_end");
-extern const char mqtt_page_start[] asm("_binary_mqtt_html_start");
-extern const char mqtt_page_end[] asm("_binary_mqtt_html_end");
+extern const char smart_home_page_start[] asm("_binary_smart_home_html_start");
+extern const char smart_home_page_end[] asm("_binary_smart_home_html_end");
 
 static const char *TAG_WIFI = "wifi_prov";
 static EventGroupHandle_t WifiEventGroup;
@@ -1003,16 +1168,24 @@ static void wizard_completed_load(void)
     nvs_close(handle);
 }
 
-static void wizard_completed_save(void)
+static bool wizard_completed_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
-    nvs_set_u8(handle, NVS_KEY_WIZARD_DONE, 1);
-    nvs_commit(handle);
+    esp_err_t err = nvs_set_u8(handle, NVS_KEY_WIZARD_DONE, 1);
+    if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
+    if (err != ESP_OK) return false;
     WizardCompleted = true;
+    return true;
+}
+
+static bool wizard_completed_save(void)
+{
+    return run_internal_flash_op(wizard_completed_save_direct, NULL);
 }
 
 static bool load_wifi_credentials(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
@@ -1036,7 +1209,7 @@ static bool load_wifi_credentials(char *ssid, size_t ssid_len, char *pass, size_
     return strlen(ssid) > 0;
 }
 
-static esp_err_t save_wifi_credentials(const char *ssid, const char *pass)
+static esp_err_t save_wifi_credentials_direct(const char *ssid, const char *pass)
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -1052,6 +1225,25 @@ static esp_err_t save_wifi_credentials(const char *ssid, const char *pass)
     }
     nvs_close(handle);
     return err;
+}
+
+typedef struct {
+    const char *ssid;
+    const char *pass;
+    esp_err_t result;
+} wifi_store_request_t;
+
+static bool wifi_store_direct(void *arg)
+{
+    wifi_store_request_t *request = (wifi_store_request_t *)arg;
+    request->result = save_wifi_credentials_direct(request->ssid, request->pass);
+    return request->result == ESP_OK;
+}
+
+static esp_err_t save_wifi_credentials(const char *ssid, const char *pass)
+{
+    wifi_store_request_t request = {.ssid = ssid, .pass = pass, .result = ESP_FAIL};
+    return run_internal_flash_op(wifi_store_direct, &request) ? request.result : ESP_FAIL;
 }
 
 static void sta_event_handler(
@@ -1571,6 +1763,8 @@ static const httpd_uri_t api_version_uri = {
 
 static esp_err_t api_status_get_handler(httpd_req_t *req)
 {
+    ESP_LOGI(TAG_WIFI, "HTTP dispatch GET /api/status; stack HWM=%u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     int64_t __req_start_us = esp_timer_get_time();
     diag_log("http GET /api/status start");
     if (!EthConnected) {
@@ -2421,14 +2615,25 @@ static esp_err_t api_debug_stacks_get_handler(httpd_req_t *req)
 static const httpd_uri_t api_debug_stacks_uri = {
     .uri = "/api/debug/stacks", .method = HTTP_GET, .handler = api_debug_stacks_get_handler};
 
-static esp_err_t api_wifi_reset_post_handler(httpd_req_t *req)
+static bool wifi_credentials_erase_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_erase_key(handle, NVS_KEY_SSID);
-        nvs_erase_key(handle, NVS_KEY_PASS);
-        nvs_commit(handle);
+        esp_err_t err = nvs_erase_key(handle, NVS_KEY_SSID);
+        if (err == ESP_OK) err = nvs_erase_key(handle, NVS_KEY_PASS);
+        if (err == ESP_OK) err = nvs_commit(handle);
         nvs_close(handle);
+        return err == ESP_OK;
+    }
+    return false;
+}
+
+static esp_err_t api_wifi_reset_post_handler(httpd_req_t *req)
+{
+    if (!run_internal_flash_op(wifi_credentials_erase_direct, NULL)) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
     }
 
     ESP_LOGI(TAG_WIFI, "WiFi credentials cleared via dashboard, restarting in 2s...");
@@ -2485,15 +2690,62 @@ static void ota_password_load(void)
     }
 }
 
-static void ota_password_store(const char *pw)
+typedef struct {
+    char password[OTA_PASSWORD_MAX_LEN + 1];
+    SemaphoreHandle_t finished;
+    bool ok;
+} ota_password_store_request_t;
+
+/* NVS commits write flash and therefore cannot execute on the PSRAM-backed
+ * HTTPD stack. Keep this tiny persistence operation on an internal-RAM stack,
+ * just as OTA image writes are handled below. */
+static void ota_password_store_worker(void *arg)
 {
+    ota_password_store_request_t *request = (ota_password_store_request_t *)arg;
     nvs_handle_t handle;
-    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
-        nvs_set_str(handle, OTA_NVS_KEY_PASSWORD, pw);
-        nvs_commit(handle);
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, OTA_NVS_KEY_PASSWORD, request->password);
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+        }
         nvs_close(handle);
     }
-    strlcpy(OtaPassword, pw, sizeof(OtaPassword));
+    request->ok = err == ESP_OK;
+    if (request->ok) {
+        strlcpy(OtaPassword, request->password, sizeof(OtaPassword));
+    } else {
+        ESP_LOGE(TAG_WIFI, "OTA password NVS save failed: %s", esp_err_to_name(err));
+    }
+    xSemaphoreGive(request->finished);
+    vTaskDelete(NULL);
+}
+
+static bool ota_password_store(const char *pw)
+{
+    ota_password_store_request_t *request = heap_caps_calloc(
+        1, sizeof(*request), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!request) {
+        return false;
+    }
+    request->finished = xSemaphoreCreateBinary();
+    if (!request->finished) {
+        heap_caps_free(request);
+        return false;
+    }
+    strlcpy(request->password, pw, sizeof(request->password));
+    if (xTaskCreatePinnedToCore(ota_password_store_worker, "ota_pw_save", 4096,
+                                request, 6, NULL, 0) != pdPASS) {
+        vSemaphoreDelete(request->finished);
+        heap_caps_free(request);
+        ESP_LOGE(TAG_WIFI, "OTA password worker could not start");
+        return false;
+    }
+    xSemaphoreTake(request->finished, portMAX_DELAY);
+    bool ok = request->ok;
+    vSemaphoreDelete(request->finished);
+    heap_caps_free(request);
+    return ok;
 }
 
 /* Constant-time-ish compare - avoids an early-exit strcmp() timing signal on
@@ -2567,6 +2819,75 @@ static bool check_ota_auth(httpd_req_t *req)
     return true;
 }
 
+#define OTA_CHUNK_BYTES 512
+typedef struct {
+    size_t len;
+    bool final;
+    bool abort;
+    uint8_t data[OTA_CHUNK_BYTES];
+} ota_chunk_t;
+
+typedef struct {
+    QueueHandle_t chunks;
+    SemaphoreHandle_t finished;
+    size_t image_len;
+    esp_err_t result;
+} ota_session_t;
+
+/* The connected-mode HTTP task runs from PSRAM so its 32 KiB BACnet handler
+ * stack fits. ESP-IDF deliberately forbids flash writes on a PSRAM stack,
+ * because cache is disabled during the write. This worker therefore owns all
+ * esp_ota_* calls and has a small, temporary internal-RAM stack; HTTPD only
+ * receives and queues network data. */
+static void ota_flash_worker(void *arg)
+{
+    ota_session_t *session = (ota_session_t *)arg;
+    const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+    esp_ota_handle_t handle = 0;
+    bool begun = false;
+    bool failed = partition == NULL;
+    esp_err_t err = partition ? esp_ota_begin(partition, session->image_len, &handle) : ESP_ERR_NOT_FOUND;
+    if (err == ESP_OK) {
+        begun = true;
+        ESP_LOGI(TAG_WIFI, "OTA: writing %u bytes to partition '%s' at 0x%lx from internal worker",
+                 (unsigned)session->image_len, partition->label, (unsigned long)partition->address);
+    } else {
+        failed = true;
+        ESP_LOGE(TAG_WIFI, "OTA: esp_ota_begin failed: %s", esp_err_to_name(err));
+    }
+
+    for (;;) {
+        ota_chunk_t chunk;
+        if (xQueueReceive(session->chunks, &chunk, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (chunk.abort) {
+            failed = true;
+        } else if (!chunk.final && !failed && esp_ota_write(handle, chunk.data, chunk.len) != ESP_OK) {
+            failed = true;
+            ESP_LOGE(TAG_WIFI, "OTA: esp_ota_write failed");
+        }
+        if (chunk.final) {
+            break;
+        }
+    }
+
+    if (begun && failed) {
+        esp_ota_abort(handle);
+    } else if (begun) {
+        err = esp_ota_end(handle);
+        if (err == ESP_OK) {
+            err = esp_ota_set_boot_partition(partition);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_WIFI, "OTA: image finalization failed: %s", esp_err_to_name(err));
+        }
+    }
+    session->result = failed ? ESP_FAIL : err;
+    xSemaphoreGive(session->finished);
+    vTaskDelete(NULL);
+}
+
 static esp_err_t api_ota_post_handler(httpd_req_t *req)
 {
     if (!check_ota_auth(req)) {
@@ -2578,80 +2899,62 @@ static esp_err_t api_ota_post_handler(httpd_req_t *req)
         return ESP_OK;
     }
 
-    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
-    if (!update_partition) {
+    ota_session_t *session = heap_caps_calloc(1, sizeof(*session), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!session) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-    ESP_LOGI(
-        TAG_WIFI, "OTA: writing %lu bytes to partition '%s' at 0x%lx",
-        (unsigned long)req->content_len, update_partition->label,
-        (unsigned long)update_partition->address);
-
-    esp_ota_handle_t ota_handle;
-    esp_err_t err = esp_ota_begin(update_partition, req->content_len, &ota_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_WIFI, "esp_ota_begin failed: %s", esp_err_to_name(err));
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    char *buf = malloc(2048);
-    if (!buf) {
-        esp_ota_abort(ota_handle);
+    session->chunks = xQueueCreate(2, sizeof(ota_chunk_t));
+    session->finished = xSemaphoreCreateBinary();
+    session->image_len = req->content_len;
+    if (!session->chunks || !session->finished ||
+        xTaskCreatePinnedToCore(ota_flash_worker, "ota_flash", 4096, session, 6, NULL, 0) != pdPASS) {
+        if (session->chunks) vQueueDelete(session->chunks);
+        if (session->finished) vSemaphoreDelete(session->finished);
+        heap_caps_free(session);
+        ESP_LOGE(TAG_WIFI, "OTA: could not start internal flash worker");
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
     size_t remaining = req->content_len;
-    bool write_failed = false;
+    bool receive_failed = false;
     while (remaining > 0) {
-        int to_recv = remaining < 2048 ? (int)remaining : 2048;
-        int recv_len = httpd_req_recv(req, buf, to_recv);
+        ota_chunk_t chunk = {0};
+        int recv_len = httpd_req_recv(req, (char *)chunk.data,
+                                      remaining < OTA_CHUNK_BYTES ? (int)remaining : OTA_CHUNK_BYTES);
         if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
             continue;
         }
         if (recv_len <= 0) {
-            write_failed = true;
+            receive_failed = true;
             break;
         }
-        if (esp_ota_write(ota_handle, buf, recv_len) != ESP_OK) {
-            write_failed = true;
+        chunk.len = (size_t)recv_len;
+        if (xQueueSend(session->chunks, &chunk, pdMS_TO_TICKS(10000)) != pdTRUE) {
+            receive_failed = true;
             break;
         }
-        remaining -= (size_t)recv_len;
+        remaining -= chunk.len;
     }
-    free(buf);
+    ota_chunk_t final_chunk = {.final = true, .abort = receive_failed};
+    xQueueSend(session->chunks, &final_chunk, portMAX_DELAY);
+    xSemaphoreTake(session->finished, portMAX_DELAY);
 
-    if (write_failed) {
-        esp_ota_abort(ota_handle);
-        ESP_LOGE(TAG_WIFI, "OTA: transfer failed with %lu bytes remaining", (unsigned long)remaining);
+    esp_err_t result = session->result;
+    vQueueDelete(session->chunks);
+    vSemaphoreDelete(session->finished);
+    heap_caps_free(session);
+    if (receive_failed || result != ESP_OK) {
+        ESP_LOGE(TAG_WIFI, "OTA: transfer failed with %u bytes remaining", (unsigned)remaining);
         httpd_resp_set_status(req, "500 Internal Server Error");
         httpd_resp_send(req, "{\"ok\":false,\"error\":\"transfer failed\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
 
-    err = esp_ota_end(ota_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_WIFI, "esp_ota_end failed (bad image?): %s", esp_err_to_name(err));
-        httpd_resp_set_status(req, "422 Unprocessable Entity");
-        httpd_resp_send(
-            req, "{\"ok\":false,\"error\":\"image validation failed - not flashed\"}",
-            HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
-    }
-
-    err = esp_ota_set_boot_partition(update_partition);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG_WIFI, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
     ESP_LOGW(TAG_WIFI, "OTA: image written and validated, rebooting into it in 2s...");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();
     return ESP_OK;
@@ -2690,15 +2993,15 @@ static esp_err_t wizard_page_get_handler(httpd_req_t *req)
 static const httpd_uri_t wizard_page_uri = {
     .uri = "/wizard", .method = HTTP_GET, .handler = wizard_page_get_handler};
 
-static esp_err_t mqtt_page_get_handler(httpd_req_t *req)
+static esp_err_t smart_home_page_get_handler(httpd_req_t *req)
 {
-    const uint32_t len = mqtt_page_end - mqtt_page_start;
+    const uint32_t len = smart_home_page_end - smart_home_page_start;
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_send(req, mqtt_page_start, len);
+    httpd_resp_send(req, smart_home_page_start, len);
     return ESP_OK;
 }
-static const httpd_uri_t mqtt_page_uri = {
-    .uri = "/mqtt", .method = HTTP_GET, .handler = mqtt_page_get_handler};
+static const httpd_uri_t smart_home_page_uri = {
+    .uri = "/smart-home", .method = HTTP_GET, .handler = smart_home_page_get_handler};
 
 
 
@@ -2727,7 +3030,10 @@ static esp_err_t api_setup_password_post_handler(httpd_req_t *req)
         return ESP_OK; /* check_ota_auth already sent the 401 */
     }
 
-    ota_password_store(pw);
+    if (!ota_password_store(pw)) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
     ESP_LOGI(TAG_WIFI, "OTA update password set via setup wizard Step 1");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -2808,7 +3114,15 @@ static uint8_t ScanPercent = 0;
 static char ScanErrorMsg[64] = {0};
 static TaskHandle_t ScanTaskHandle = NULL;
 static volatile bool ScanTaskFinished = false;
-static StaticTask_t ScanTaskTcb;
+/* Must be heap_caps_calloc'd with MALLOC_CAP_INTERNAL, not a plain static.
+ * A FreeRTOS static task's TCB must always live in internal RAM even though
+ * its stack can be in PSRAM; with CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
+ * enabled for Matter, internal .bss got tight enough that the linker's
+ * automatic .bss-overflow-to-PSRAM fallback swept this plain static struct
+ * into PSRAM, and xTaskCreateStaticPinnedToCore's xPortCheckValidTCBMem()
+ * check aborted with "assert failed" the moment a scan started. Same fix
+ * matter_adapter.cpp already uses for its own sync task's TCB. */
+static StaticTask_t *ScanTaskTcb = NULL;
 static StackType_t *ScanTaskStack = NULL;
 
 /* The commissioning scan is optional and transient. Keep its sizeable stack
@@ -2822,6 +3136,10 @@ static void scan_task_cleanup(void)
     if (ScanTaskStack != NULL) {
         heap_caps_free(ScanTaskStack);
         ScanTaskStack = NULL;
+    }
+    if (ScanTaskTcb != NULL) {
+        heap_caps_free(ScanTaskTcb);
+        ScanTaskTcb = NULL;
     }
     ScanTaskFinished = false;
 }
@@ -3001,21 +3319,28 @@ static esp_err_t api_objects_scan_start_handler(httpd_req_t *req)
        task is transient - created per scan, deleted at the end - so this is
        borrowed for the duration of a scan, not held. */
     ScanTaskStack = heap_caps_malloc(24576, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!ScanTaskStack) {
+    ScanTaskTcb = heap_caps_calloc(1, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!ScanTaskStack || !ScanTaskTcb) {
         ScanState = SCAN_STATE_ERROR;
-        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "no PSRAM for scan task");
+        snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "no memory for scan task");
+        heap_caps_free(ScanTaskStack);
+        ScanTaskStack = NULL;
+        heap_caps_free(ScanTaskTcb);
+        ScanTaskTcb = NULL;
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, "{\"ok\":false,\"error\":\"insufficient PSRAM to start the scan\"}",
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"insufficient memory to start the scan\"}",
                         HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     ScanTaskHandle = xTaskCreateStaticPinnedToCore(
-        object_scan_task, "obj_scan", 24576, NULL, 5, ScanTaskStack, &ScanTaskTcb, tskNO_AFFINITY);
+        object_scan_task, "obj_scan", 24576, NULL, 5, ScanTaskStack, ScanTaskTcb, tskNO_AFFINITY);
     if (!ScanTaskHandle) {
         ScanState = SCAN_STATE_ERROR;
         snprintf(ScanErrorMsg, sizeof(ScanErrorMsg), "could not create scan task");
         heap_caps_free(ScanTaskStack);
         ScanTaskStack = NULL;
+        heap_caps_free(ScanTaskTcb);
+        ScanTaskTcb = NULL;
         for (size_t p = 0; p < SCAN_PAGE_COUNT; p++) { heap_caps_free(ScanPages[p]); ScanPages[p] = NULL; }
         ScannedObjectCount = 0;
         diag_log("obj_scan static task create failed - scan aborted");
@@ -3390,11 +3715,12 @@ static void mqtt_config_load(void)
     }
 }
 
-static void mqtt_config_save(void)
+static bool mqtt_config_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_MQTT_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
     nvs_set_str(handle, "host", MqttBrokerHost);
     nvs_set_u16(handle, "port", MqttBrokerPort);
@@ -3405,8 +3731,14 @@ static void mqtt_config_save(void)
     nvs_set_str(handle, "dev_id", HaDeviceId);
     nvs_set_u8(handle, "disc_en", HaDiscoveryEnabled ? 1 : 0);
     nvs_set_u8(handle, "hlth_en", HaHealthDiscoveryEnabled ? 1 : 0);
-    nvs_commit(handle);
+    esp_err_t err = nvs_commit(handle);
     nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static bool mqtt_config_save(void)
+{
+    return run_internal_flash_op(mqtt_config_save_direct, NULL);
 }
 
 static void custom_mqtt_load(void)
@@ -3447,11 +3779,12 @@ static void custom_mqtt_load(void)
     nvs_close(handle);
 }
 
-static void custom_mqtt_save(void)
+static bool custom_mqtt_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_CUSTOM_MQTT_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
     nvs_set_u8(handle, "count", (uint8_t)CustomMqttCount);
     for (size_t i = 0; i < CustomMqttCount; i++) {
@@ -3474,8 +3807,14 @@ static void custom_mqtt_save(void)
         snprintf(key, sizeof(key), "p%u_en", (unsigned)i);
         nvs_set_u8(handle, key, CustomMqttPoints[i].enabled ? 1 : 0);
     }
-    nvs_commit(handle);
+    esp_err_t err = nvs_commit(handle);
     nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static bool custom_mqtt_save(void)
+{
+    return run_internal_flash_op(custom_mqtt_save_direct, NULL);
 }
 
 static void parse_custom_mqtt_from_json(const char *body)
@@ -3564,17 +3903,24 @@ static void app_config_load(void)
     nvs_close(handle);
 }
 
-static void app_config_save(void)
+static bool app_config_save_direct(void *arg)
 {
+    (void)arg;
     nvs_handle_t handle;
     if (nvs_open(NVS_APP_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return;
+        return false;
     }
     nvs_set_u16(handle, NVS_KEY_BOOST_TIMEOUT, BoostTimeoutMinutes);
     nvs_set_u8(handle, NVS_KEY_BOOST_EXTERNAL, BoostRevertExternal ? 1 : 0);
     nvs_set_u8(handle, NVS_KEY_MDNS_ENABLED, MdnsEnabled ? 1 : 0);
-    nvs_commit(handle);
+    esp_err_t err = nvs_commit(handle);
     nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static bool app_config_save(void)
+{
+    return run_internal_flash_op(app_config_save_direct, NULL);
 }
 
 static esp_err_t api_objects_custom_mqtt_get_handler(httpd_req_t *req)
@@ -3934,6 +4280,8 @@ static const httpd_uri_t api_rooms_post_uri = {
 
 static esp_err_t api_integration_get_handler(httpd_req_t *req)
 {
+    ESP_LOGI(TAG_WIFI, "HTTP dispatch GET /api/integration; stack HWM=%u bytes",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
     hvac_integration_kind_t kind = hvac_core_integration_get();
     const char *mode_str = "none";
     if (kind == HVAC_INTEGRATION_MQTT_HOME_ASSISTANT) {
@@ -3970,6 +4318,29 @@ static esp_err_t api_integration_get_handler(httpd_req_t *req)
 static const httpd_uri_t api_integration_get_uri = {
     .uri = "/api/integration", .method = HTTP_GET, .handler = api_integration_get_handler};
 
+/* The integration summary is intentionally cheap. The Smart Home page uses
+ * this richer endpoint to ask CHIP for the real, current window state and
+ * the exact onboarding payload being advertised over BLE. */
+static esp_err_t api_matter_setup_get_handler(httpd_req_t *req)
+{
+    matter_onboarding_info_t info;
+    bool ok = matter_adapter_get_onboarding_info(&info);
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":%s,\"running\":%s,\"window_open\":%s,\"paired\":%s,"
+             "\"discriminator\":%u,\"vendor_id\":%u,\"product_id\":%u,"
+             "\"qr_code\":\"%s\",\"manual_code\":\"%s\"}",
+             ok ? "true" : "false", info.running ? "true" : "false",
+             info.window_open ? "true" : "false", info.paired ? "true" : "false", (unsigned)info.discriminator,
+             (unsigned)info.vendor_id, (unsigned)info.product_id,
+             info.qr_code, info.manual_code);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+static const httpd_uri_t api_matter_setup_get_uri = {
+    .uri = "/api/matter/setup", .method = HTTP_GET, .handler = api_matter_setup_get_handler};
+
 static esp_err_t api_matter_retry_pairing_post_handler(httpd_req_t *req)
 {
     if (hvac_core_integration_get() != HVAC_INTEGRATION_MATTER) {
@@ -3979,7 +4350,9 @@ static esp_err_t api_matter_retry_pairing_post_handler(httpd_req_t *req)
     }
     bool started = matter_adapter_retry_pairing();
     if (started) {
-        hvac_core_matter_pairing_set(HVAC_PAIRING_AWAITING);
+        if (!pairing_store(HVAC_PAIRING_AWAITING)) {
+            started = false;
+        }
     }
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"ok\":%s}", started ? "true" : "false");
@@ -3989,6 +4362,21 @@ static esp_err_t api_matter_retry_pairing_post_handler(httpd_req_t *req)
 }
 static const httpd_uri_t api_matter_retry_pairing_uri = {
     .uri = "/api/matter/retry-pairing", .method = HTTP_POST, .handler = api_matter_retry_pairing_post_handler};
+
+static esp_err_t api_matter_close_pairing_post_handler(httpd_req_t *req)
+{
+    if (hvac_core_integration_get() != HVAC_INTEGRATION_MATTER) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"ok\":false,\"error\":\"Matter is not the active integration mode\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    bool closed = matter_adapter_close_pairing();
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, closed ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+static const httpd_uri_t api_matter_close_pairing_uri = {
+    .uri = "/api/matter/close-pairing", .method = HTTP_POST, .handler = api_matter_close_pairing_post_handler};
 
 static esp_err_t api_integration_post_handler(httpd_req_t *req)
 {
@@ -4016,7 +4404,7 @@ static esp_err_t api_integration_post_handler(httpd_req_t *req)
     hvac_integration_kind_t old_mode = hvac_core_integration_get();
     hvac_integration_kind_t new_mode = (hvac_integration_kind_t)mode_val;
 
-    if (!hvac_core_integration_set(new_mode)) {
+    if (!integration_store(new_mode)) {
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"ok\":false,\"error\":\"Failed to save integration mode\"}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
@@ -4500,6 +4888,11 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
     int tport = 0, tdev = 0;
     if (json_get_str(body, "target_ip", tip, sizeof(tip)) && strlen(tip) > 0) {
         strlcpy(TargetIp, tip, sizeof(TargetIp));
+        /* A manually (re)entered target is unconfirmed until Discover runs
+         * again - carrying over a previous target's confirmed name here
+         * would attach the wrong device's name to this one. */
+        TargetDeviceNameValid = false;
+        TargetDeviceName[0] = '\0';
     }
     if (json_get_int(body, "target_port", &tport) && tport > 0) {
         TargetPort = (uint16_t)tport;
@@ -4549,7 +4942,10 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
         if (strcmp(integ_mode, "none") == 0) chosen_mode = HVAC_INTEGRATION_NONE;
         else if (strcmp(integ_mode, "matter") == 0) chosen_mode = HVAC_INTEGRATION_MATTER;
     }
-    hvac_core_integration_set(chosen_mode);
+    if (!integration_store(chosen_mode)) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
     /* Only start the transport the user actually selected - each module is
      * self-contained and must not assume it is the only one configured. */
@@ -4728,7 +5124,13 @@ static esp_err_t api_config_import_handler(httpd_req_t *req)
     if (tport <= 0) json_get_int(body, "target_port", &tport);
     if (tdev <= 0) json_get_int(body, "target_device_id", &tdev);
 
-    if (strlen(tip) > 0) strlcpy(TargetIp, tip, sizeof(TargetIp));
+    if (strlen(tip) > 0) {
+        strlcpy(TargetIp, tip, sizeof(TargetIp));
+        /* Same reasoning as the wizard finish handler: a restored/edited
+         * target is unconfirmed until Discover runs again. */
+        TargetDeviceNameValid = false;
+        TargetDeviceName[0] = '\0';
+    }
     if (tport > 0) TargetPort = (uint16_t)tport;
     if (tdev > 0) TargetDeviceInstance = (uint32_t)tdev;
     target_config_save();
@@ -4745,14 +5147,12 @@ static esp_err_t api_config_import_handler(httpd_req_t *req)
         json_get_str(body, "password", w_pass, sizeof(w_pass));
     }
     if (strlen(w_ssid) > 0) {
-        nvs_handle_t whandle;
-        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &whandle) == ESP_OK) {
-            nvs_set_str(whandle, NVS_KEY_SSID, w_ssid);
-            nvs_set_str(whandle, NVS_KEY_PASS, w_pass);
-            nvs_set_u8(whandle, NVS_KEY_WIZARD_DONE, 1);
-            nvs_commit(whandle);
-            nvs_close(whandle);
+        if (save_wifi_credentials(w_ssid, w_pass) == ESP_OK && wizard_completed_save()) {
             has_wifi_update = true;
+        } else {
+            free(body);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
         }
     }
 
@@ -4862,10 +5262,9 @@ static void erase_namespace(const char *ns)
     }
 }
 
-static esp_err_t api_factory_reset_handler(httpd_req_t *req)
+static bool factory_reset_direct(void *arg)
 {
-    mqtt_unpublish_discovery();
-
+    (void)arg;
     erase_namespace(NVS_NAMESPACE);
     erase_namespace(NVS_TARGET_NAMESPACE);
     erase_namespace(NVS_ROOMS_NAMESPACE);
@@ -4874,6 +5273,16 @@ static esp_err_t api_factory_reset_handler(httpd_req_t *req)
     erase_namespace(NVS_APP_NAMESPACE);
     erase_namespace(OTA_NVS_NAMESPACE);
     hvac_core_integration_reset();
+    return true;
+}
+
+static esp_err_t api_factory_reset_handler(httpd_req_t *req)
+{
+    mqtt_unpublish_discovery();
+    if (!run_internal_flash_op(factory_reset_direct, NULL)) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -4886,6 +5295,23 @@ static const httpd_uri_t api_factory_reset_uri = {
     .uri = "/api/factory-reset", .method = HTTP_POST, .handler = api_factory_reset_handler};
 
 /* ===================== Web Server Life Cycle ===================== */
+
+/* These callbacks are deliberately allocation-free: the Matter profile can
+ * accept TCP connections while its dashboard stops dispatching requests. They
+ * establish whether that failure is before or after HTTPD's session layer. */
+static esp_err_t http_session_open_trace(httpd_handle_t hd, int sockfd)
+{
+    (void)hd;
+    ESP_LOGI(TAG_WIFI, "HTTP session opened fd=%d; stack HWM=%u bytes", sockfd,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    return ESP_OK;
+}
+
+static void http_session_close_trace(httpd_handle_t hd, int sockfd)
+{
+    (void)hd;
+    ESP_LOGI(TAG_WIFI, "HTTP session closed fd=%d", sockfd);
+}
 
 static esp_err_t api_logs_get_handler(httpd_req_t *req)
 {
@@ -4939,10 +5365,34 @@ static httpd_handle_t start_connected_webserver(void)
        report this task's stack high-water mark so the real margin is
        measurable instead of guessed - tune from that, not from intuition. */
     config.stack_size = CONNECTED_HTTP_STACK_SIZE;
+    /* HTTPD needs 32 KiB on this board for the BACnet decode handlers, but at
+     * connected-mode startup the largest internal block is only 14 KiB.  The
+     * task itself has no ISR use; place its stack in PSRAM (enabled by
+     * CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY) and retain internal memory
+     * for Wi-Fi/lwIP and Matter control structures. */
+    config.task_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    /* ESP-IDF HTTPD defaults to priority 5, the same priority used by the
+     * Matter and BACnet workers. On the live Matter build TCP completed its
+     * handshake but HTTPD never reached its session callback. Keep it one
+     * level above those background workers so dashboard requests are drained
+     * promptly, while Wi-Fi/lwIP still run at their much higher priorities. */
+    config.task_priority = 6;
+    /* Keep the dashboard worker off CPU0, where Wi-Fi/lwIP and the Matter
+     * platform event path run.  On the live Matter image, TCP handshakes
+     * complete but HTTPD's open callback never runs; pinning this independent
+     * select()/handler loop to CPU1 tests scheduler starvation directly. */
+    config.core_id = 1;
     config.max_uri_handlers = 60;
+    config.open_fn = http_session_open_trace;
+    config.close_fn = http_session_close_trace;
 
     ESP_LOGI(TAG_WIFI, "Starting connected-mode dashboard server on port: '%d'", config.server_port);
-    if (httpd_start(&server, &config) == ESP_OK) {
+    esp_err_t httpd_err = httpd_start(&server, &config);
+    if (httpd_err == ESP_OK) {
+        ESP_LOGI(TAG_WIFI, "Connected-mode HTTPD started (core=%d priority=%u stack=%uB; heap=%uB largest=%uB)",
+                 (int)config.core_id, (unsigned)config.task_priority, (unsigned)config.stack_size,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
         httpd_register_uri_handler(server, &manage_uri);
         httpd_register_uri_handler(server, &status_page_uri);
         httpd_register_uri_handler(server, &health_page_uri);
@@ -4950,7 +5400,7 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &update_page_uri);
         httpd_register_uri_handler(server, &objects_page_uri);
         httpd_register_uri_handler(server, &wizard_page_uri);
-        httpd_register_uri_handler(server, &mqtt_page_uri);
+        httpd_register_uri_handler(server, &smart_home_page_uri);
         httpd_register_uri_handler(server, &api_network_uri);
         httpd_register_uri_handler(server, &api_version_uri);
         httpd_register_uri_handler(server, &api_status_uri);
@@ -4980,7 +5430,9 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &api_rooms_post_uri);
         httpd_register_uri_handler(server, &api_integration_get_uri);
         httpd_register_uri_handler(server, &api_integration_post_uri);
+        httpd_register_uri_handler(server, &api_matter_setup_get_uri);
         httpd_register_uri_handler(server, &api_matter_retry_pairing_uri);
+        httpd_register_uri_handler(server, &api_matter_close_pairing_uri);
         httpd_register_uri_handler(server, &api_mqtt_config_get_uri);
         httpd_register_uri_handler(server, &api_mqtt_config_post_uri);
         httpd_register_uri_handler(server, &api_mqtt_entities_uri);
@@ -4992,6 +5444,12 @@ static httpd_handle_t start_connected_webserver(void)
         httpd_register_uri_handler(server, &api_config_export_uri);
         httpd_register_uri_handler(server, &api_config_import_uri);
         httpd_register_uri_handler(server, &api_logs_uri);
+    } else {
+        ESP_LOGE(TAG_WIFI, "Connected-mode HTTPD failed to start: %s (core=%d priority=%u stack=%uB; heap=%uB largest=%uB)",
+                 esp_err_to_name(httpd_err), (int)config.core_id, (unsigned)config.task_priority,
+                 (unsigned)config.stack_size,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
     }
     return server;
 }
@@ -5023,7 +5481,9 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &api_rooms_post_uri);
         httpd_register_uri_handler(server, &api_integration_get_uri);
         httpd_register_uri_handler(server, &api_integration_post_uri);
+        httpd_register_uri_handler(server, &api_matter_setup_get_uri);
         httpd_register_uri_handler(server, &api_matter_retry_pairing_uri);
+        httpd_register_uri_handler(server, &api_matter_close_pairing_uri);
         httpd_register_uri_handler(server, &api_mqtt_config_get_uri);
         httpd_register_uri_handler(server, &api_mqtt_config_post_uri);
         httpd_register_uri_handler(server, &api_mqtt_test_uri);
@@ -6165,6 +6625,8 @@ void app_main(void)
     app_config_load();
     wizard_completed_load();
     ota_password_load();
+    matter_adapter_set_system_power_handlers(matter_system_power_write, matter_system_power_read);
+    matter_adapter_set_boost_handlers(matter_boost_write, matter_boost_read);
 
     spawn_task(eth_bringup_task, "eth_bringup", 4096, NULL, 5, NULL);
 

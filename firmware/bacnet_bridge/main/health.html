@@ -51,12 +51,10 @@
           <a href="/health" class="active">Health</a>
         </div>
       </div>
-      <div class="nav-links">
-        <a href="/mqtt">MQTT</a>
-      </div>
       <div>
         <div class="nav-label">Proxy</div>
         <div class="nav-links">
+          <a href="/smart-home">Smart Home</a>
           <a href="/status">Status</a>
           <a href="/reset">Reset</a>
           <a href="/update">Update</a>
@@ -78,11 +76,6 @@
     <div class="card" id="automationCard" style="display:none;">
       <h3 style="margin-top:0;">Automation</h3>
       <div class="row"><span class="label">Mode</span><span class="value" id="autoMode">–</span></div>
-      <div class="row" id="autoPairingRow" style="display:none;">
-        <span class="label">Matter pairing</span><span class="value" id="autoPairing">–</span>
-      </div>
-      <p class="sub" id="autoPairingNote" style="display:none;"></p>
-      <button type="button" class="refresh" id="btnRetryPairing" style="display:none; margin-top:0.4em;">Retry Pairing</button>
     </div>
 
     <h2>Measured <span id="modeBadge" class="tag" style="margin-left:0.5em; font-size:0.8em; font-weight:bold;">–</span></h2>
@@ -300,51 +293,7 @@
           card.style.display = 'block';
           document.getElementById('autoMode').textContent = modeLabels[res.mode_name] || res.mode_name;
 
-          var pairingRow = document.getElementById('autoPairingRow');
-          var pairingNote = document.getElementById('autoPairingNote');
-          var retryBtn = document.getElementById('btnRetryPairing');
-          if (res.mode_name !== 'matter') {
-            pairingRow.style.display = 'none';
-            pairingNote.style.display = 'none';
-            retryBtn.style.display = 'none';
-            return;
-          }
-
-          pairingRow.style.display = 'flex';
-          var pairingLabels = {
-            idle: ['Not yet started', 'neutral'],
-            awaiting_pairing: ['Pairing window open', 'amber'],
-            paired: ['Paired', 'ok'],
-            timed_out: ['Window closed - not paired', 'bad']
-          };
-          var pl = pairingLabels[res.matter_pairing_status] || [res.matter_pairing_status, 'neutral'];
-          var pairingEl = document.getElementById('autoPairing');
-          pairingEl.textContent = pl[0];
-          pairingEl.className = 'value ' + pl[1];
-
-          if (res.matter_pairing_status === 'timed_out') {
-            pairingNote.style.display = 'block';
-            pairingNote.textContent = 'The 10-minute pairing window closed before a controller connected. Retry to open a new one.';
-            retryBtn.style.display = 'inline-block';
-          } else {
-            pairingNote.style.display = 'none';
-            retryBtn.style.display = 'none';
-          }
         }).catch(function() {});
-      }
-
-      function retryMatterPairing() {
-        var btn = document.getElementById('btnRetryPairing');
-        btn.disabled = true;
-        btn.textContent = 'Opening window...';
-        fetch('/api/matter/retry-pairing', { method: 'POST' }).then(function(r) { return r.json(); }).then(function() {
-          btn.disabled = false;
-          btn.textContent = 'Retry Pairing';
-          loadIntegrationStatus();
-        }).catch(function() {
-          btn.disabled = false;
-          btn.textContent = 'Retry Pairing';
-        });
       }
 
       function load() {
@@ -434,13 +383,12 @@
 
       document.getElementById('refreshBtn').addEventListener('click', load);
       document.getElementById('refreshBtn').addEventListener('click', loadIntegrationStatus);
-      document.getElementById('btnRetryPairing').addEventListener('click', retryMatterPairing);
       load();
       loadIntegrationStatus();
     </script>
     <footer style="margin-top: 2.5em; padding-top: 1em; border-top: 1px solid #eee; font-size: 0.75rem; color: #64748b; text-align: center; line-height: 1.5;">
       <span>ESP32 BACnet Bridge · Customised for Delta DAC-1180E systems (West Hampstead Square)</span><br>
-      <span>Created by <a href="mailto:piers@wingfield.tech" style="color: #0284c7; text-decoration: none;">Piers Wingfield</a> · Free &amp; Open Source under MIT License · <a href="https://github.com/pierswingfield/esp-bacnet" target="_blank" style="color: #0284c7; text-decoration: none;">GitHub</a></span>
+      <span>Created by <a href="mailto:piers@wingfield.tech" style="color: #0284c7; text-decoration: none;">Piers Wingfield</a> · Free &amp; Open Source under MIT License · <a href="https://github.com/pierswingfield/pw-esp-bacnet-proxy" target="_blank" style="color: #0284c7; text-decoration: none;">GitHub</a></span>
     </footer>
   </body>
 </html>

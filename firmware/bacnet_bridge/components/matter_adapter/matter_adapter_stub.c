@@ -26,6 +26,20 @@ esp_err_t matter_adapter_init(void)
 #endif
 }
 
+void matter_adapter_set_system_power_handlers(matter_system_power_write_cb_t write_cb,
+                                              matter_system_power_read_cb_t read_cb)
+{
+    (void)write_cb;
+    (void)read_cb;
+}
+
+void matter_adapter_set_boost_handlers(matter_boost_write_cb_t write_cb,
+                                       matter_boost_read_cb_t read_cb)
+{
+    (void)write_cb;
+    (void)read_cb;
+}
+
 esp_err_t matter_adapter_start(void)
 {
 #if defined(CONFIG_ENABLE_ESP_MATTER) && CONFIG_ENABLE_ESP_MATTER
@@ -64,6 +78,19 @@ bool matter_adapter_is_running(void)
 bool matter_adapter_retry_pairing(void)
 {
     return false;
+}
+
+bool matter_adapter_close_pairing(void)
+{
+    return false;
+}
+
+bool matter_adapter_get_onboarding_info(matter_onboarding_info_t *out)
+{
+    if (out) {
+        *out = (matter_onboarding_info_t){0};
+    }
+    return true;
 }
 
 /* ========================================================================= */

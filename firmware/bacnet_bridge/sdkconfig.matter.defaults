@@ -12,6 +12,10 @@ CONFIG_BT_NIMBLE_ENABLED=y
 # NimBLE's own host/controller buffers to external memory too.
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
+# The Matter attribute-sync task needs an 8 KiB stack, but keeping that
+# non-ISR task stack internal left HTTPD unable to create a connection
+# session.  Its TCB remains internal; only the stack is placed in PSRAM.
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 
 # CHIP/Matter requires IPv6
@@ -27,6 +31,23 @@ CONFIG_MBEDTLS_HKDF_C=y
 # The CHIP stack's own task/event-loop needs more headroom than the
 # project's existing default main task stack.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# CHIP's own event-loop task ("CHIP") was silently defaulting to 8192 bytes.
+# That was enough for one Matter endpoint doing one attribute::update() per
+# push, but overflowed ~15s after boot once matter_adapter.cpp started
+# chaining up to 9 attribute::update() calls (system mode + 4 fields x N
+# rooms) inside a single ScheduleLambda - confirmed via serial: "A stack
+# overflow in task CHIP has been detected", looping every boot. Doubling to
+# 16384 still overflowed at the same point; 32768 then failed to allocate at
+# all ("Failed to launch Matter main task") because CHIP's task stack is a
+# plain dynamic xTaskCreate that only searches internal DRAM, and this
+# board's largest contiguous internal block is ~14KB - CONFIG_SPIRAM_ALLOW_
+# STACK_EXTERNAL_MEMORY does not apply to it. The real fix was structural
+# (matter_adapter.cpp now schedules one attribute::update() per lambda, so
+# the CHIP task never chains deeper than the original single-endpoint case);
+# this bump is just headroom, sized to fit inside that ~14KB internal
+# ceiling rather than trying to out-grow it.
+CONFIG_CHIP_TASK_STACK_SIZE=12288
 
 # Shrinks CHIP_CONFIG_MAX_FABRICS and a few IM pool sizes to fit this
 # board's internal DRAM; see main/chip_project_config.h for why.

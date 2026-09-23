@@ -25,6 +25,36 @@ typedef enum {
     MATTER_SYSTEM_MODE_HEAT = 4,
 } matter_system_mode_t;
 
+/* The system-level Matter endpoint is a plain OnOff switch (device type
+ * On/Off Plug-in Unit), not a thermostat: there is no home-level
+ * temperature control or mode, only whether the plant is allowed to run at
+ * all. */
+typedef bool (*matter_system_power_write_cb_t)(bool on);
+typedef bool (*matter_system_power_read_cb_t)(bool *out_on);
+void matter_adapter_set_system_power_handlers(matter_system_power_write_cb_t write_cb,
+                                              matter_system_power_read_cb_t read_cb);
+
+/* Boost Heat and Boost Cool are BACnet-level plant commands (see
+ * boost_apply() in main.c) - full-output overrides, not room comfort modes.
+ * Exposed as two plain OnOff switches rather than one 3-state control:
+ * Matter/Google Home has no small "pick one of three" widget that fits this
+ * (Mode Select exists but Google's consumer app support for it is
+ * inconsistent outside specific device types), while two switches reuse the
+ * exact OnOff pattern already proven for the system power switch. Mutual
+ * exclusion is enforced by the write callback below (in main.c), not by
+ * matter_adapter - turning one on turns the other off; the target argument
+ * tells the callback which switch changed. */
+typedef enum {
+    MATTER_BOOST_TARGET_HEAT,
+    MATTER_BOOST_TARGET_COOL,
+} matter_boost_target_t;
+typedef bool (*matter_boost_write_cb_t)(matter_boost_target_t target, bool on);
+/* AUTO = no boost active; HEAT/COOL = that boost is active. OFF is not a
+ * valid output here (boost is orthogonal to system power). */
+typedef bool (*matter_boost_read_cb_t)(matter_system_mode_t *out_mode);
+void matter_adapter_set_boost_handlers(matter_boost_write_cb_t write_cb,
+                                       matter_boost_read_cb_t read_cb);
+
 /**
  * @brief Initializes the Matter adapter subsystem.
  * On hardware profiles without Matter support (e.g. W5500 4MB),
@@ -54,6 +84,28 @@ bool matter_adapter_is_running(void);
  * @return true if a window was (re)opened, false otherwise.
  */
 bool matter_adapter_retry_pairing(void);
+
+/** Closes an open commissioning window. Does not remove an existing fabric. */
+bool matter_adapter_close_pairing(void);
+
+/* The setup payload is deliberately obtained from the running Matter stack,
+ * rather than copied from a build-time default. That keeps the web guide in
+ * lock-step with the discriminator and credentials being advertised. */
+#define MATTER_ONBOARDING_QR_MAX 128
+#define MATTER_ONBOARDING_MANUAL_CODE_MAX 32
+typedef struct {
+    bool running;
+    bool window_open;
+    bool paired;
+    uint16_t discriminator;
+    uint16_t vendor_id;
+    uint16_t product_id;
+    char qr_code[MATTER_ONBOARDING_QR_MAX];
+    char manual_code[MATTER_ONBOARDING_MANUAL_CODE_MAX];
+} matter_onboarding_info_t;
+
+/** Returns the live commissioning-window state and current setup payload. */
+bool matter_adapter_get_onboarding_info(matter_onboarding_info_t *out);
 
 /* ========================================================================= */
 /* Matter Thermostat Endpoint (Cluster 0x0201) Attribute Handlers             */

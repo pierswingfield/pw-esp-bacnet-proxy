@@ -126,12 +126,7 @@ in the T-ETH-Lite architecture document.
 
 ## Planned Future Roadmap
 
-- [ ] **Local Matter integration**: One Matter-over-Wi-Fi module for direct
-  Apple Home, Google Home and Alexa control on the T-ETH-Lite profile. MQTT /
-  Home Assistant remains an optional integration, not a prerequisite.
-
-The implementation assessment, hardware scope and staged verification plan are
-in [`docs/MATTER_INTEGRATION_ASSESSMENT_AND_PLAN.md`](docs/MATTER_INTEGRATION_ASSESSMENT_AND_PLAN.md).
+See [`docs/BACKLOG.md`](docs/BACKLOG.md) for planned future work.
 
 ---
 
