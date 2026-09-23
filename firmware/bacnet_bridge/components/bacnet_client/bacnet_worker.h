@@ -81,6 +81,10 @@ typedef struct {
     int raw_data_len;
     bacnet_discovered_dev_t discovered[MAX_DISCOVERED_DEVICES];
     size_t discovered_count;
+    /* Unique devices seen this discovery pass, even past
+     * MAX_DISCOVERED_DEVICES - lets a caller tell "found everything" apart
+     * from "storage capped, more devices actually responded". */
+    size_t discovered_seen_count;
 } bacnet_response_t;
 
 typedef void (*bacnet_async_cb_t)(const bacnet_response_t *resp, void *user_arg);
@@ -133,9 +137,11 @@ bacnet_worker_status_t bacnet_worker_explorer_write_sync(
     uint8_t priority, const BACNET_APPLICATION_DATA_VALUE *val,
     uint32_t timeout_ms);
 
+/* out_seen_count (nullable) is the true number of unique devices seen this
+ * pass, even past max_devs - compare it to *out_count to detect truncation. */
 bacnet_worker_status_t bacnet_worker_discover_sync(
     bacnet_discovered_dev_t *out_devs, size_t max_devs,
-    size_t *out_count, uint32_t timeout_ms);
+    size_t *out_count, size_t *out_seen_count, uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

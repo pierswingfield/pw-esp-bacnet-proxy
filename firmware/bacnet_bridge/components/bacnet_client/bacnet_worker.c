@@ -72,6 +72,11 @@ static int s_last_read_raw_len = 0;
 /* Discovery Response State */
 static bacnet_discovered_dev_t s_discovered_devs[MAX_DISCOVERED_DEVICES];
 static size_t s_discovered_count = 0;
+/* Counts every I-Am seen this discovery pass, even past MAX_DISCOVERED_DEVICES
+ * - without this, a network with more responders than the fixed storage array
+ * silently reported the same result as one with fewer, with no way to tell
+ * discovery was incomplete. */
+static size_t s_discovered_seen_count = 0;
 
 /* Read Cache */
 typedef enum {
@@ -308,6 +313,7 @@ static void worker_i_am_handler(
         }
     }
 
+    s_discovered_seen_count++;
     if (s_discovered_count < MAX_DISCOVERED_DEVICES) {
         size_t idx = s_discovered_count++;
         s_discovered_devs[idx].device_id = device_id;
@@ -463,6 +469,7 @@ static void execute_worker_discovery(bacnet_request_t *req, bacnet_response_t *r
 {
     (void)req;
     s_discovered_count = 0;
+    s_discovered_seen_count = 0;
 
     Send_WhoIs_Global(-1, -1);
 
@@ -498,6 +505,7 @@ static void execute_worker_discovery(bacnet_request_t *req, bacnet_response_t *r
 
     resp->status = BACNET_WORKER_STATUS_OK;
     resp->discovered_count = s_discovered_count;
+    resp->discovered_seen_count = s_discovered_seen_count;
     memcpy(resp->discovered, s_discovered_devs, sizeof(s_discovered_devs));
 }
 
@@ -946,7 +954,7 @@ bacnet_worker_status_t bacnet_worker_explorer_write_sync(
 
 bacnet_worker_status_t bacnet_worker_discover_sync(
     bacnet_discovered_dev_t *out_devs, size_t max_devs,
-    size_t *out_count, uint32_t timeout_ms)
+    size_t *out_count, size_t *out_seen_count, uint32_t timeout_ms)
 {
     if (!out_devs || !out_count || !s_is_ready) return BACNET_WORKER_STATUS_INVALID_ARG;
 
@@ -961,6 +969,7 @@ bacnet_worker_status_t bacnet_worker_discover_sync(
         size_t count = resp.discovered_count > max_devs ? max_devs : resp.discovered_count;
         memcpy(out_devs, resp.discovered, count * sizeof(bacnet_discovered_dev_t));
         *out_count = count;
+        if (out_seen_count) *out_seen_count = resp.discovered_seen_count;
     }
     return status;
 }

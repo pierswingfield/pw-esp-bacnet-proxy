@@ -536,6 +536,7 @@ static esp_netif_t *EthNetif = NULL;
 
 static bacnet_discovered_dev_t DiscoveredDevices[MAX_DISCOVERED_DEVICES];
 static size_t DiscoveredDeviceCount = 0;
+static size_t DiscoveredDeviceSeenCount = 0;
 
 static void eth_event_handler(
     void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -3112,6 +3113,12 @@ static uint32_t ScanCurrent = 0;
 static uint32_t ScanTotal = 0;
 static uint8_t ScanPercent = 0;
 static char ScanErrorMsg[64] = {0};
+/* MAX_SCANNED_OBJECTS is a fixed catalog size (PSRAM budget, not an
+ * arbitrary guess), but a real controller can have more objects than that -
+ * without this flag, a scan that stopped early because it hit the cap
+ * reported the same "complete" state as one that saw every object, with no
+ * way to tell the two apart. */
+static volatile bool ScanTruncated = false;
 static TaskHandle_t ScanTaskHandle = NULL;
 static volatile bool ScanTaskFinished = false;
 /* Must be heap_caps_calloc'd with MALLOC_CAP_INTERNAL, not a plain static.
@@ -3198,6 +3205,7 @@ static void object_scan_task(void *arg)
     ScanPercent = 0;
     ScanTotal = 0;
     ScanErrorMsg[0] = '\0';
+    ScanTruncated = false;
 
     if (!BacnetReady || !EthConnected) {
         ScanState = SCAN_STATE_ERROR;
@@ -3269,6 +3277,11 @@ static void object_scan_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
+    if (found >= MAX_SCANNED_OBJECTS && ScanCurrent < total) {
+        ScanTruncated = true;
+        diag_log("object scan hit the %u-object catalog cap with %u of %u objects still unread",
+                 (unsigned)MAX_SCANNED_OBJECTS, (unsigned)(total - ScanCurrent), (unsigned)total);
+    }
     ScanState = SCAN_STATE_COMPLETE;
     ScanTaskFinished = true;
     task_registry_remove_self();
@@ -3365,9 +3378,10 @@ static esp_err_t api_objects_scan_status_handler(httpd_req_t *req)
 
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "{\"ok\":true,\"state\":\"%s\",\"current\":%u,\"total\":%u,\"percent\":%u,\"count\":%u,\"error\":\"%s\"}",
+             "{\"ok\":true,\"state\":\"%s\",\"current\":%u,\"total\":%u,\"percent\":%u,\"count\":%u,"
+             "\"truncated\":%s,\"error\":\"%s\"}",
              st_str, (unsigned)ScanCurrent, (unsigned)ScanTotal, (unsigned)ScanPercent,
-             (unsigned)ScannedObjectCount, ScanErrorMsg);
+             (unsigned)ScannedObjectCount, ScanTruncated ? "true" : "false", ScanErrorMsg);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -4007,6 +4021,15 @@ static esp_err_t api_objects_custom_mqtt_post_handler(httpd_req_t *req)
                 break;
             }
         }
+        /* CustomMqttCount == MAX_CUSTOM_MQTT used to silently no-op here
+         * while still returning {"ok":true} below - the UI reported success
+         * for a point that was never actually added. */
+        if (!found && CustomMqttCount >= MAX_CUSTOM_MQTT) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_send(req, "{\"ok\":false,\"error\":\"custom point limit reached (32)\"}",
+                            HTTPD_RESP_USE_STRLEN);
+            return ESP_OK;
+        }
         if (!found && CustomMqttCount < MAX_CUSTOM_MQTT) {
             strlcpy(CustomMqttPoints[CustomMqttCount].type_str, tstr, sizeof(CustomMqttPoints[CustomMqttCount].type_str));
             CustomMqttPoints[CustomMqttCount].obj_type = (uint16_t)otype;
@@ -4048,7 +4071,8 @@ static esp_err_t api_bacnet_discover_handler(httpd_req_t *req)
     json_get_int(body, "device_id", &req_dev_id);
 
     if (EthConnected) {
-        bacnet_worker_discover_sync(DiscoveredDevices, MAX_DISCOVERED_DEVICES, &DiscoveredDeviceCount, 4000);
+        bacnet_worker_discover_sync(DiscoveredDevices, MAX_DISCOVERED_DEVICES, &DiscoveredDeviceCount,
+                                    &DiscoveredDeviceSeenCount, 4000);
         if (DiscoveredDeviceCount > 0) {
             TargetDeviceInstance = DiscoveredDevices[0].device_id;
             strlcpy(TargetIp, DiscoveredDevices[0].ip, sizeof(TargetIp));
@@ -4065,7 +4089,9 @@ static esp_err_t api_bacnet_discover_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    size_t off = snprintf(buf, 4096, "{\"ok\":true,\"count\":%u,\"devices\":[", (unsigned)DiscoveredDeviceCount);
+    size_t off = snprintf(buf, 4096, "{\"ok\":true,\"count\":%u,\"truncated\":%s,\"devices\":[",
+                          (unsigned)DiscoveredDeviceCount,
+                          DiscoveredDeviceSeenCount > DiscoveredDeviceCount ? "true" : "false");
     for (size_t i = 0; i < DiscoveredDeviceCount; i++) {
         char name_esc[64] = "", vend_esc[64] = "", mod_esc[64] = "";
         json_escape(name_esc, DiscoveredDevices[i].name, sizeof(name_esc));
