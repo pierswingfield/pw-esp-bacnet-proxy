@@ -7,26 +7,26 @@ Matter at 6 rooms: swept for other places where a specific-install
 assumption or fixed limit isn't actually configurable per the project's
 own protocol-agnostic, scalable-by-design intent. Three silent-truncation
 bugs of the same shape (object scan, custom MQTT points, BACnet discovery)
-were found and fixed directly. The items below are real but are design
-decisions, not one-line fixes - listed here rather than changed blind.
+were found and fixed directly, and three of the five architectural items
+below were subsequently addressed too (BACnet discovery's scan range,
+the bridge's static IP, mDNS hostname collisions) - see their commits for
+detail. The remaining two are real but are design decisions needing their
+own dedicated pass, not one-line fixes.
 
-- **BACnet discovery is hardcoded to a `10.0.3.x` unicast scan range**:
-  `execute_worker_discovery()` in `bacnet_worker.c` explicitly unicasts
-  Who-Is to `10.0.3.1` through `10.0.3.32` (plus broadcasts to
-  `10.0.3.255` and the BACnet/IP broadcast address), in addition to
-  sending a global Who-Is. On an isolated segment numbered differently
-  than the documented `10.0.3.x` convention (see root `CLAUDE.md`),
-  discovery would rely on the broadcast path alone rather than genuinely
-  scan the actual configured subnet - the unicast sweep gives it a much
-  higher hit rate on the convention this project has always used, but
-  wouldn't adapt to a different one.
-- **The bridge's own static IP is compiled in**: `LOCAL_STATIC_IP
-  "10.0.3.99"` in `main.c` has no settings-page override; changing it
-  needs a firmware rebuild. This one may be intentional - root
-  `CLAUDE.md` documents "both profiles use the same static address" on
-  the isolated segment - but it's worth naming explicitly as a real
-  hardcode either way, so a future decision to make it configurable
-  (or to keep it fixed on purpose) is made deliberately, not by omission.
+~~**BACnet discovery hardcoded to a `10.0.3.x` unicast scan range**~~ -
+fixed: `execute_worker_discovery()` now derives the scan range from the
+bridge's own live IP (`esp_netif_get_ip_info`) instead of a hardcoded
+subnet.
+
+~~**The bridge's own static IP was compiled in**~~ - fixed: Ethernet
+bring-up now tries DHCP first (5s), falling back to the historical
+static config only if nothing answers - a differently set up segment
+that runs DHCP now gets a correct address automatically.
+
+~~**mDNS hostname was a single fixed string**~~ - fixed: probes for an
+existing responder on the default name before claiming it, falls back
+to `-1`, `-2`, etc. on collision.
+
 - **System power/boost/health object instance numbers are hardcoded to
   this specific Delta DAC-1180E's program**: `SYS_POWER_WRITE_INSTANCE`,
   `SYS_POWER_READBACK_INSTANCE`, `BOOST_INSTANCE`, and the full
@@ -38,6 +38,20 @@ decisions, not one-line fixes - listed here rather than changed blind.
   different FCU controller model, or a different vendor's BACnet device
   entirely. Anyone deploying this against different controller logic
   needs a firmware rebuild, not a settings change.
+  Also found while scoping this: the same constants are independently
+  `#define`'d in both `main.c` and `hvac_core/include/hvac_core.h` (kept
+  in sync by hand today) - any fix needs to pick one owner first, or it
+  just adds a second place to forget to update.
+  Feasibility: making these *configurable* (NVS-backed, same pattern as
+  `rooms.json`) is straightforward - the object scan already walks
+  `PROP_OBJECT_LIST` and reads names, so the read side exists. Making
+  them *automatic* is not realistically feasible: BACnet has no semantic
+  tag for "this MSV is the boost mode" - even this controller's mapping
+  only exists because it was manually diffed against known-good/known-bad
+  states (Phase 0.5). The practical version is a points-mapping UI (like
+  `rooms.json`'s per-room instances) where the scan **suggests** candidates
+  by matching object names against expected patterns, and a human
+  confirms - not blind auto-detection.
 - **`HVAC_CORE_MAX_ROOMS` (8) and `CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT`
   (16) are two independent constants that must be kept in sync by hand**:
   at 8 rooms the Matter side needs aggregator(1) + system(1) + boost(2) +
@@ -47,11 +61,6 @@ decisions, not one-line fixes - listed here rather than changed blind.
   worth of config without any build-time check tying the two together -
   worth a `static_assert` or Kconfig cross-check rather than relying on
   whoever changes one constant remembering to check the other.
-- **mDNS hostname is a single fixed string** (`MDNS_HOSTNAME
-  "esp-bacnet-bridge"`, `main.c`): fine for one bridge per network (the
-  expected deployment), but two bridges on the same LAN would collide.
-  Low priority given the product's actual use pattern, noted for
-  completeness.
 
 ## Automatic updates
 
