@@ -256,8 +256,14 @@
           if (st.state === 'error') { self.scanFailed(st.error || 'scan error'); resolve(); return; }
           self.truncated = !!st.truncated;
           getJson('/api/objects').then(function (cat) {
-            if (cat && cat.ok && cat.objects && cat.objects.length) self.useCatalog(cat.objects);
-            else self.scanFailed('the scan returned no objects');
+            if (cat && cat.ok && cat.objects && cat.objects.length) {
+              self.useCatalog(cat.objects);
+              /* The scan refreshed the device's shared catalogue; let the
+                 host page re-render anything it built from the old one. */
+              if (self.opts.onScanned) self.opts.onScanned(cat.objects);
+            } else {
+              self.scanFailed('the scan returned no objects');
+            }
             resolve();
           });
         }).catch(function () { setTimeout(tick, 2500); });

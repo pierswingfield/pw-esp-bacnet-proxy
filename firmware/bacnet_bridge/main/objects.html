@@ -242,7 +242,11 @@
         var mapper = null;
         section.addEventListener('toggle', function () {
           if (!section.open || mapper || typeof PointMapper === 'undefined') return;
-          mapper = new PointMapper(document.getElementById('pointMapper'), { showSave: true, expanded: true });
+          mapper = new PointMapper(document.getElementById('pointMapper'), {
+            showSave: true, expanded: true,
+            /* The mapping scan replaces the catalogue the browser below shows. */
+            onScanned: function () { if (typeof fetchObjectsFromESP === 'function') fetchObjectsFromESP(); }
+          });
           mapper.start();
         });
       })();
