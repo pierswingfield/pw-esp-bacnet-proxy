@@ -1,75 +1,5 @@
 # Backlog
 
-## HTTP "Connection reset by peer" - time-driven, likely Matter CASE-resumption retry (2026-09-23)
-
-Open since 2026-09-12 ("one open HTTP-reset bug not yet root-caused" -
-ping stays healthy at 7-8ms, HTTP stops accepting new connections,
-confirmed persistent/non-self-resolving at the time). Investigated live
-tonight by two Claude sessions working in parallel; the TIME_WAIT theory
-below was proposed, tested, and **falsified** - recorded here so the
-disproven path isn't retrodden.
-
-First reproduction: object scan's status-polling
-(`/api/objects/scan-status` every ~4s) died at t=38s/55% through a scan
-with `httpd_accept_conn: error in accept (23)` on serial (errno 23 =
-ENFILE, system-wide socket table exhausted).
-
-Eliminated as causes (each independently confirmed by reading the actual
-code, not assumed):
-- **BACnet's own networking**: `bip_init()` opens exactly one UDP socket
-  once at worker startup; the scan dispatches through the existing
-  worker queue and never calls `socket()` itself.
-- **Two httpd instances**: `start_provisioning_ap()` and
-  `start_connected_webserver()` (main.c ~5580/~5700) are mutually
-  exclusive within a boot (provisioning only runs when STA connect
-  fails), never concurrent - only one 8-socket httpd pool ever exists.
-- **espressif__mdns**: off by default (`MdnsEnabled` gates
-  `mdns_start_service()`), not a factor unless a user opts in; its
-  create/delete socket pairing in `mdns_networking_socket.c` also looks
-  correctly guarded on every path checked.
-- **Matter's entire networking stack, checked twice**: `UDPEndPointImplLwIP.cpp`
-  (connectedhomeip `src/inet/`) uses raw lwIP PCBs (`udp_new`/`struct
-  udp_pcb`), never calls `socket()`. Matter's own minimal-mDNS
-  advertisement (`src/lib/dnssd/minimal_mdns/Server.cpp`) and the CASE
-  session-establishment call chain
-  (`CASESessionManager::FindOrEstablishSession` ->
-  `FindOrEstablishSessionHelper`) both bottom out on the same
-  `chip::Inet::UDPEndPoint`. Espressif's own esp-matter components
-  (not just vanilla connectedhomeip) were also grepped for any
-  ESP32-specific `socket()` override - none found. No BSD-socket-touching
-  point could be found anywhere in Matter's networking or session/
-  subscription-resumption code by static reading.
-
-**Disproven**: a TIME_WAIT-accumulation theory (fast HTTP polling
-outliving httpd's `lru_purge_enable`d 8-socket pool at the lwIP level,
-exhausting the shared 16-socket table). **Falsified by direct experiment**:
-slowing the poll interval 5x (1.2s -> 5s) did not meaningfully delay the
-failure (both still failed within ~5s of each other in wall-clock uptime:
-~62.7s vs ~67.6s), and the same boot hit a **second, unprompted ENFILE at
-up=267s with zero HTTP polling happening in between** - it recurred on its
-own. A request-volume-driven theory cannot explain either result.
-
-**Current strongest lead**: something schedule-driven since boot, not
-traffic-driven. The one thing on that schedule in serial on every
-reproduction so far: `chip[IN]: SendMessage() ... failed: 3000004` /
-`chip[DMG]: Failed to establish CASE for subscription-resumption with
-error '3000004'` at ~5-14s uptime.
-`SubscriptionResumptionSessionEstablisher::HandleDeviceConnectionFailure`
-(connectedhomeip `src/app/SubscriptionResumptionSessionEstablisher.cpp`)
-retries via `InteractionModelEngine::TryToResumeSubscriptions()` with
-Fibonacci backoff on failure - a real retry-compounds-on-failure shape -
-but tracing where that retry actually allocates a resource still leads
-back to the same raw-PCB transport already ruled out above, so the exact
-leaked resource (if it's a leak in this codebase at all, rather than a
-Matter-stack-internal pool exhaustion with a secondary effect on httpd)
-remains unidentified.
-
-**Next step, since static reading is exhausted**: dynamic instrumentation
-- log open socket/fd count (or free entries in
-`CONFIG_LWIP_MAX_SOCKETS`) alongside uptime across a boot, correlated
-against the CASE-resumption retry log lines, to catch the actual resource
-being consumed rather than inferring it from source.
-
 ## Hardcoded-assumption sweep (2026-09-23)
 
 Prompted by finding the room-config truncation bug while stress-testing
@@ -122,12 +52,15 @@ to `-1`, `-2`, etc. on collision.
   `rooms.json`'s per-room instances) where the scan **suggests** candidates
   by matching object names against expected patterns, and a human
   confirms - not blind auto-detection.
-~~**`HVAC_CORE_MAX_ROOMS` (8) and `CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT`
-(16) were two independent constants kept in sync by hand**~~ - fixed: a
-`static_assert` in `matter_adapter.cpp` now fails the build if
-`HVAC_CORE_MAX_ROOMS + 4` (aggregator + system + 2 boost switches)
-exceeds the configured Matter endpoint budget, instead of silently
-overflowing it at runtime.
+- **`HVAC_CORE_MAX_ROOMS` (8) and `CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT`
+  (16) are two independent constants that must be kept in sync by hand**:
+  at 8 rooms the Matter side needs aggregator(1) + system(1) + boost(2) +
+  rooms(8) = 12 of the 16 available dynamic endpoints. Raising
+  `HVAC_CORE_MAX_ROOMS` alone in the future (e.g. to 12, for a larger
+  home) would silently exceed the Matter endpoint budget at 16 rooms'
+  worth of config without any build-time check tying the two together -
+  worth a `static_assert` or Kconfig cross-check rather than relying on
+  whoever changes one constant remembering to check the other.
 
 ## Automatic updates
 
@@ -196,6 +129,15 @@ overflowing it at runtime.
   single-purpose `/smart-home` page; review layout, copy and information
   density now that it sits inside the merged module-switcher page rather
   than as a standalone destination.
+
+## Object scanning UX
+
+- The Objects page scan gives no progress indication beyond the raw
+  percentage text and doesn't warn the user up front that the web UI
+  becomes unresponsive while a scan runs (it walks the controller's full
+  object list over BACnet, one ReadProperty per object, and the HTTP task
+  is busy driving that). Add a visible progress bar and a clear warning
+  before the scan starts, not just a number that updates via polling.
 
 ## Firmware release consolidation
 

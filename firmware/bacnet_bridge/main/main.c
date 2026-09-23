@@ -540,10 +540,7 @@ static esp_netif_t *EthNetif = NULL;
 
 #define BacnetReady (bacnet_worker_is_ready())
 
-/* ~1.3KB (8 * ~168B struct) - moved to PSRAM to buy back internal DRAM
- * headroom; this array is only touched from the (rare, user-initiated)
- * discovery flow, never from a hot path. */
-static EXT_RAM_BSS_ATTR bacnet_discovered_dev_t DiscoveredDevices[MAX_DISCOVERED_DEVICES];
+static bacnet_discovered_dev_t DiscoveredDevices[MAX_DISCOVERED_DEVICES];
 static size_t DiscoveredDeviceCount = 0;
 static size_t DiscoveredDeviceSeenCount = 0;
 
@@ -5407,6 +5404,14 @@ static void http_session_close_trace(httpd_handle_t hd, int sockfd)
 {
     (void)hd;
     ESP_LOGI(TAG_WIFI, "HTTP session closed fd=%d", sockfd);
+    /* Setting close_fn hands socket ownership to us: httpd only closes the
+     * socket itself when no close_fn is set (esp_http_server.h). Without
+     * this, every connection leaked one of CONFIG_LWIP_MAX_SOCKETS (16), and
+     * after ~12 new connections accept() failed with ENFILE - existing
+     * keep-alive browser tabs kept working, but no new client could connect
+     * until a power cycle. The fd may already be invalid if the stack closed
+     * it; close() then just fails harmlessly. */
+    close(sockfd);
 }
 
 static esp_err_t api_logs_get_handler(httpd_req_t *req)
