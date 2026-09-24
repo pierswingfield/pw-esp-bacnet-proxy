@@ -89,6 +89,12 @@ bool matter_adapter_get_onboarding_info(matter_onboarding_info_t *out)
 {
     if (out) {
         *out = (matter_onboarding_info_t){0};
+        /* Mirror matter_adapter_is_running() - this stub build has no real
+         * CHIP stack, so window/paired/QR fields stay zeroed, but `running`
+         * must still agree with /api/integration's matter_active, or the
+         * Smart Home page (which reads this endpoint) disagrees with the
+         * status the rest of the UI shows. */
+        out->running = s_matter_running;
     }
     return true;
 }

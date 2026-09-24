@@ -7029,7 +7029,22 @@ void app_main(void)
     ESP_LOGI("MAIN", "  Open Source under MIT License · Free for Community Use");
     ESP_LOGI("MAIN", "=======================================================");
 
-    ESP_ERROR_CHECK(nvs_flash_init());
+    /* A partition-table change (moving between build profiles with
+     * different NVS sizes) or a truncated erase can leave the NVS
+     * partition in a state nvs_flash_init() won't accept - it returns
+     * ESP_ERR_NVS_NO_FREE_PAGES or ESP_ERR_NVS_NEW_VERSION_FOUND rather
+     * than silently coping. Bare ESP_ERROR_CHECK on that return previously
+     * meant the whole app aborted before anything else ran (no WiFi AP, no
+     * HTTP, no BACnet) - reboot, abort, reboot, forever, with no log
+     * reaching a phone or browser to explain why. Recreate the partition
+     * once in that case, matching ESP-IDF's own documented pattern. */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW("MAIN", "nvs_flash_init: %s - erasing and reinitialising", esp_err_to_name(nvs_err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
 
     esp_ota_mark_app_valid_cancel_rollback();
 

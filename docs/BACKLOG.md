@@ -1,5 +1,52 @@
 # Backlog
 
+## Matter DNS-SD advertiser can fail to start under low internal heap (2026-09-24)
+
+Observed live on the test device (T-ETH-Lite, Matter build, 21-point map
+confirmed, 2 rooms): right after `matter_adapter_start()` finishes creating
+endpoints, internal heap was down to ~6.6KB with a largest free block of
+~2.3KB. `chip[DIS]` then logged `Failed to initialize advertiser: 3000008`,
+`Failed to remove advertised services: 3`, `Failed to advertise
+commissionable node: 3`, `Failed to finalize service update: 3`. The rest of
+Matter came up fine (`matter_active`/`running`/`window_open` all true,
+endpoints live, thermostat clusters report), so this isn't fatal - but a
+failed DNS-SD advertisement means the device may not appear in a phone's
+Matter "add device" scan even while otherwise healthy, and there was no
+retry observed. A second boot (same firmware, no other changes) may or may
+not hit it - internal heap headroom at this exact moment depends on WiFi/
+Ethernet/BACnet worker startup timing, so it's a timing-sensitive resource
+race, not a deterministic failure. Matches the long-standing heap-budget
+story for this board (see the ESP32 heap-budget and heap/stack-budget
+memory notes) - BACnet + Ethernet + WiFi + HTTP + Matter concurrently is
+close to this board's internal-RAM ceiling. Worth a retry (or a deferred
+start once other subsystems have settled) around `DiscoverableAdvertiser`
+startup rather than treating it as one-shot.
+
+## Fresh `idf.py` build directories can silently pick the wrong partition table (2026-09-24)
+
+Building a brand-new `build-t-eth` directory with the documented command
+(`idf.py -B build-t-eth -DSDKCONFIG=build-t-eth/sdkconfig
+-DSDKCONFIG_DEFAULTS='sdkconfig.defaults;sdkconfig.t_eth_lite.defaults'
+build`) produced a resulting sdkconfig with
+`CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"` (the old
+master-branch 1900K-slot table) instead of
+`sdkconfig.t_eth_lite.defaults`'s `partitions_t_eth_lite.csv` (4MB slots) -
+even though the later file in `SDKCONFIG_DEFAULTS` should override the
+earlier one for the same key. Flashing that image over USB (bootloader +
+partition table + app) silently rewrote the device's flash layout to the
+small-slot table, and a subsequent OTA of a normal ~2.4MB T-ETH-Lite/Matter
+image then failed with `esp_ota_begin failed: ESP_ERR_INVALID_SIZE` because
+it no longer fit. A pre-existing build directory (e.g.
+`build-t-eth-matter` under `~/esp-bacnet-nospace`, built correctly in an
+earlier session) was unaffected - only fresh directories with both default
+files passed together were seen to have this happen. Not yet root-caused
+(kconfig default-merge ordering, or something order-dependent in how the
+two files' custom-filename choices interact); reproduce deliberately in an
+isolated build dir before trusting this documented command for a from-
+scratch T-ETH-Lite build again, and verify
+`grep CONFIG_PARTITION_TABLE_CUSTOM_FILENAME <builddir>/sdkconfig` picked
+`partitions_t_eth_lite.csv` before flashing.
+
 ## Hardcoded-assumption sweep (2026-09-23)
 
 Prompted by finding the room-config truncation bug while stress-testing
@@ -143,6 +190,23 @@ the alarm binary-values used by the Health page.
 - Rename the Update page to "System" (nav label, page title, and its
   `<h1>`) - it already covers OTA, mDNS and backup/restore, not just
   updates, and now also OTA password management.
+
+## Project naming
+
+- Rename `esp-bacnet-setup` (the onboarding Wi-Fi AP SSID) and the project
+  name itself across the codebase - currently named for the original
+  BACnet-only scope, predates the protocol-agnostic/Matter/MQTT direction.
+
+## Onboarding wizard
+
+- Rename the "Proceed to MQTT" button to "Proceed to smart home setup" -
+  wizard now covers more than MQTT.
+- Add a "None / set up later" option so the user can skip configuring any
+  smart-home module during onboarding - check whether this already exists
+  before implementing.
+- More in-wizard guidance when the user chooses Matter setup. Immediate gap:
+  the Footer needs a reboot button (and a backing API endpoint) - currently
+  there's no way to reboot from that step of the flow.
 
 ## Privacy policy
 
