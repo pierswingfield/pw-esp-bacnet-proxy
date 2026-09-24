@@ -171,6 +171,10 @@
         fetch('/api/network').then(function (r) { return r.json(); }).then(function (d) {
           box.checked = !!d.mdns_enabled;
           if (d.mdns_hostname) { host.textContent = d.mdns_hostname; }
+          if (d.mdns_matter_conflict) {
+            box.disabled = true;
+            note.textContent = "Off while Matter is the active integration - they share the same network responder, and Matter needs it. Switch Matter off first if you need .local access.";
+          }
         }).catch(function () { note.textContent = 'Could not read the current setting.'; });
 
         box.addEventListener('change', function () {

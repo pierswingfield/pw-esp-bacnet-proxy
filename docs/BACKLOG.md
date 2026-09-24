@@ -1,26 +1,63 @@
 # Backlog
 
-## Matter DNS-SD advertiser can fail to start under low internal heap (2026-09-24)
+## Freeze the partition table with headroom, so future changes never need serial (2026-09-24)
 
-Observed live on the test device (T-ETH-Lite, Matter build, 21-point map
-confirmed, 2 rooms): right after `matter_adapter_start()` finishes creating
-endpoints, internal heap was down to ~6.6KB with a largest free block of
-~2.3KB. `chip[DIS]` then logged `Failed to initialize advertiser: 3000008`,
-`Failed to remove advertised services: 3`, `Failed to advertise
-commissionable node: 3`, `Failed to finalize service update: 3`. The rest of
-Matter came up fine (`matter_active`/`running`/`window_open` all true,
-endpoints live, thermostat clusters report), so this isn't fatal - but a
-failed DNS-SD advertisement means the device may not appear in a phone's
-Matter "add device" scan even while otherwise healthy, and there was no
-retry observed. A second boot (same firmware, no other changes) may or may
-not hit it - internal heap headroom at this exact moment depends on WiFi/
-Ethernet/BACnet worker startup timing, so it's a timing-sensitive resource
-race, not a deterministic failure. Matches the long-standing heap-budget
-story for this board (see the ESP32 heap-budget and heap/stack-budget
-memory notes) - BACnet + Ethernet + WiFi + HTTP + Matter concurrently is
-close to this board's internal-RAM ceiling. Worth a retry (or a deferred
-start once other subsystems have settled) around `DiscoverableAdvertiser`
-startup rather than treating it as one-shot.
+Evaluated re-architecting so the device never needs a serial reflash again,
+even across future partition-layout changes. Current
+[partitions_t_eth_lite.csv](../firmware/bacnet_bridge/partitions_t_eth_lite.csv)
+(4MB flash): `nvs` 24K, `otadata` 8K, `phy_init` 4K, `ota_0`/`ota_1` 1900K
+each, `coredump` 64K - ~148K unaccounted slack, not a real reserved
+partition. Current app image is ~1.15MB, so each OTA slot already has
+~750K headroom for the app to *grow*, but there's no room to add a *new*
+partition without shrinking the OTA slots, which means a new table.
+
+The partition table itself lives in one unmirrored region at flash offset
+`0x8000` - no A/B copy like the app slots have. OTA-updating it directly is
+technically possible but brings real brick risk (power loss mid-write
+leaves the bootloader unable to find any table), and this device is
+headless in a wall enclosure with no easy recovery access. Not worth
+building that safety net (staged write, checksum, fallback) versus the
+alternative below.
+
+Recommended approach: one more deliberate serial flash with a rebalanced
+table - shrink `ota_0`/`ota_1` to ~1600K each (still 450K headroom over the
+current image) and carve out an explicit ~700K `reserved` gap at the end.
+Future partition needs (bigger NVS, a config blob store, etc.) get a new
+table entry that lands inside that gap without moving existing offsets, so
+it ships as a normal OTA app update - not a table change. This only fails
+to cover: needing an OTA slot bigger than ~1600K, or needing a third OTA
+slot. Do this as a dedicated pass, sizing the reserved gap against actual
+current image size before locking it in.
+
+~~**Matter DNS-SD advertiser failed to start**~~ - fixed (2026-09-24): a real
+Apple Home pairing attempt got all the way through BLE PASE and several
+`GeneralCommissioning` invokes, then failed with a communication error. The
+device-side log showed `chip[DIS]: Failed to initialize advertiser:
+3000008`, then the same family of errors (`Failed to remove advertised
+services: 3`, `Failed to advertise commissionable node: 3`, later
+`Operational advertising failed: 3`) on every boot, immediately - not a
+heap-decays-over-time thing, a first suspicion (moving `CONFIG_MDNS_TASK_
+CREATE_FROM_SPIRAM`/`CONFIG_MDNS_MEMORY_ALLOC_SPIRAM` on, since mDNS
+defaulted to internal-only RAM) that turned out not to be it: same failure
+after that change. Root cause, confirmed by decoding the error and by a
+live A/B test: `3000008` is `0x03000008` - top byte `0x03` is CHIP's
+`Range::kLwIP`, low 24 bits `8` is lwIP's `ERR_USE` (address/port already
+in use). This bridge's own mDNS responder (`esp-bacnet-bridge.local`,
+`mdns_start_service()` in `main.c`) and Matter's own DNS-SD advertiser both
+go through the same shared `esp_mdns` component/socket - with both trying
+to run, Matter loses. Disabling the bridge's own mDNS toggle made pairing
+work immediately (user-confirmed live). Fixed properly rather than by
+convention: `mdns_apply_setting()` now refuses to start the bridge's own
+responder whenever Matter is the active integration, regardless of the
+saved preference, and re-applies on every integration-mode change; `POST
+/api/device/mdns` rejects turning it on while Matter is active with a
+clear error; `/api/network` reports `mdns_matter_conflict` so the Update
+page greys the toggle out with an explanation instead of silently no-oping
+it. This is a real, permanent trade-off while Matter is selected (not just
+during the pairing window - the same failure re-triggers on ordinary
+post-pairing operational re-advertising too), not a narrower one worth
+trying to shrink: reach the bridge by IP instead, same fallback mDNS-off
+installs already needed.
 
 ## Fresh `idf.py` build directories can silently pick the wrong partition table (2026-09-24)
 
@@ -207,6 +244,25 @@ the alarm binary-values used by the Health page.
 - More in-wizard guidance when the user chooses Matter setup. Immediate gap:
   the Footer needs a reboot button (and a backing API endpoint) - currently
   there's no way to reboot from that step of the flow.
+- If the Controller Analysis step has already run (re-entering the wizard
+  after a previous pass), don't re-run it by default - show the existing
+  results and offer a "re-run analysis" option instead.
+- **Bug: re-running Controller Analysis duplicates rooms.** Went from 2 rooms
+  to 5 after a re-run; each of the 3 new rooms appears to carry the
+  bedroom's BACnet data rather than its own. Likely an append-instead-of-
+  replace when the analysis result is merged into existing room config -
+  worth checking alongside the re-run item above since re-run behaviour is
+  clearly not idempotent right now.
+- **Bug: Status page shows "Target device: Not confirmed yet"** even though
+  the target should be configured. Trigger unclear - seen fresh, not yet
+  correlated to a reboot (a reboot-revert case for this exact field was
+  already fixed, see `main.c` around `target_config_load()`) or to a wizard
+  re-run. Renders from `s.bacnet_target_name` being empty in
+  [status.html:115](../firmware/bacnet_bridge/main/status.html:115) - check
+  whether discovery is actually failing/not being confirmed, or whether the
+  name is being lost somewhere after a successful discovery (possibly same
+  root cause as the room-duplication bug above, if wizard re-runs are
+  clobbering NVS state generally).
 
 ## Privacy policy
 

@@ -78,3 +78,22 @@ CONFIG_CHIP_DISCOVERY_TIMEOUT_SECS=600
 # bring-up both drawing on the internal-only reserve pool at the same
 # instant. Give that reserve more headroom for exactly this kind of spike.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
+
+# mDNS defaults to internal-only for both its task stack and its own
+# dynamic allocations (service records etc.) - one more internal-DRAM
+# consumer on a board that's already starved of it. Confirmed live
+# (2026-09-24): CHIP's own DNS-SD advertiser failed on every boot,
+# immediately (~15s in, well before any long-run heap decay) -
+# "Failed to initialize advertiser", then later "Operational advertising
+# failed" once real commissioning reached that stage - and a real Apple
+# Home pairing attempt got all the way through BLE PASE and several
+# GeneralCommissioning invokes before failing with a communication error,
+# because the device could never advertise itself for the operational
+# (post-commissioning) phase. Moving mDNS's task and allocations to PSRAM
+# frees the internal DRAM CHIP's own DNS-SD code needs at that exact
+# moment. Needs SPIRAM_USE_MALLOC (already on above) or
+# SPIRAM_USE_CAPS_ALLOC; verify live after this change, not just that it
+# builds - the failure was 100% reproducible, so a clean pairing is the
+# actual test.
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y

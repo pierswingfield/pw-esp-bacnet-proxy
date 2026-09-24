@@ -131,6 +131,7 @@ static EXT_RAM_BSS_ATTR char MdnsHostname[40];
 static bool MdnsEnabled = false;
 static bool MdnsRunning = false;
 static void mdns_apply_setting(void);
+static bool mdns_blocked_by_matter(void);
 
 /* ===================== Task registry & checked spawn =====================
    Every xTaskCreate() in this file used to ignore its return value. That is
@@ -1763,11 +1764,13 @@ static esp_err_t api_network_get_handler(httpd_req_t *req)
         "{\"wifi_ssid\":\"%s\",\"wifi_ip\":\"%s\",\"wifi_rssi\":%s,\"eth_connected\":%s,"
         "\"bacnet_target_name\":%s,\"bacnet_target_ip\":\"%s\","
         "\"uptime_seconds\":%lld,\"last_reset_reason\":\"%s\",\"last_reset_is_power_issue\":%s,"
-        "\"ota_password_set\":%s,\"mdns_enabled\":%s,\"mdns_hostname\":\"%s.local\"}",
+        "\"ota_password_set\":%s,\"mdns_enabled\":%s,\"mdns_hostname\":\"%s.local\","
+        "\"mdns_matter_conflict\":%s}",
         StaSsid, StaIp, rssi_json, EthConnected ? "true" : "false", name_json, TargetIp,
         (long long)uptime_s, reset_reason, reset_is_power_issue ? "true" : "false",
         ota_password_is_set() ? "true" : "false",
-        MdnsEnabled ? "true" : "false", MdnsHostname);
+        MdnsEnabled ? "true" : "false", MdnsHostname,
+        mdns_blocked_by_matter() ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, off);
@@ -2553,6 +2556,14 @@ static esp_err_t api_device_mdns_post_handler(httpd_req_t *req)
         enable = false;
     } else {
         send_bad_request(req, "{\"ok\":false,\"error\":\"value must be on or off\"}");
+        return ESP_OK;
+    }
+
+    if (enable && mdns_blocked_by_matter()) {
+        send_bad_request(req,
+            "{\"ok\":false,\"error\":\"mDNS can't run alongside Matter - both share the same "
+            "network responder, and Matter needs it. Switch off Matter first, or use Matter's "
+            "own discovery.\"}");
         return ESP_OK;
     }
 
@@ -4716,6 +4727,10 @@ static esp_err_t api_integration_post_handler(httpd_req_t *req)
             matter_adapter_init();
             matter_adapter_start();
         }
+        /* Matter and this bridge's own mDNS responder can't run together
+           (see mdns_blocked_by_matter()) - re-apply on every mode change,
+           in either direction. */
+        mdns_apply_setting();
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -5284,6 +5299,9 @@ static esp_err_t api_wizard_finish_handler(httpd_req_t *req)
         matter_adapter_init();
         matter_adapter_start();
     }
+    /* Matter and this bridge's own mDNS responder can't run together - see
+       mdns_blocked_by_matter(). */
+    mdns_apply_setting();
     wizard_completed_save();
     free(body);
 
@@ -7003,10 +7021,28 @@ static void mdns_stop_service(void)
     ESP_LOGI(TAG_WIFI, "mDNS stopped");
 }
 
-/* Bring the responder in line with MdnsEnabled. Safe to call repeatedly. */
+/* This bridge and Matter's own DNS-SD advertiser both go through the same
+ * shared esp_mdns component/socket - confirmed live (2026-09-24): with both
+ * running, Matter's own advertiser lost the race for it every time
+ * ("Failed to initialize advertiser", decodes to lwIP ERR_USE - address
+ * already in use), which meant Apple Home got through BLE commissioning
+ * but could never reach the device afterward and reported a communication
+ * error. Disabling this responder made pairing work immediately. Matter
+ * needs sole use of that shared component, so its own DNS-SD advertising
+ * already covers discovery while Matter is the active integration - this
+ * responder must stay off regardless of the saved preference, not just by
+ * convention. */
+static bool mdns_blocked_by_matter(void)
+{
+    return hvac_core_integration_get() == HVAC_INTEGRATION_MATTER;
+}
+
+/* Bring the responder in line with MdnsEnabled (and the Matter conflict
+   above). Safe to call repeatedly, including after an integration-mode
+   change. */
 static void mdns_apply_setting(void)
 {
-    if (MdnsEnabled) {
+    if (MdnsEnabled && !mdns_blocked_by_matter()) {
         mdns_start_service();
     } else {
         mdns_stop_service();
