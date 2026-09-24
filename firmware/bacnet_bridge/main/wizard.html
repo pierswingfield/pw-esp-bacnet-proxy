@@ -322,19 +322,54 @@
         <!-- Matter module panel -->
         <div id="matterModulePanel" class="card" style="display:none; border-left:4px solid #06c;">
           <h3 style="margin-top:0;">Matter Pairing</h3>
-          <p style="margin:0;">
-            After Save &amp; Launch, the bridge restarts. Then open <strong>Smart Home → Matter</strong>
-            to start a 10-minute pairing window and display the QR or manual code needed by your
-            phone. WiFi stays available while Bluetooth commissioning is active.
+          <p style="margin:0;" id="matterIntroText">
+            Continue to <strong>Review &amp; Apply</strong> and click <strong>Save &amp; Launch</strong>.
+            You'll come straight back to this step to pair: a 10-minute pairing window opens
+            automatically with the QR and manual code your phone needs. WiFi stays available while
+            Bluetooth commissioning is active.
           </p>
-          <p style="margin:0.8em 0 0 0;">
-            The guided pairing status and controls live in <a href="/smart-home" target="_blank">Smart Home</a>.
-          </p>
+
+          <!-- Hidden until Save & Launch succeeds with Matter selected - same state
+               machine, endpoints and QR/manual-code UI as smart_home.html's Matter
+               card, so pairing happens here instead of sending the installer off to
+               find Smart Home themselves afterward. -->
+          <div id="matterPairPanel" class="hidden" style="margin-top:0.8em;">
+            <div class="card" id="mpStateCard">
+              <div class="status"><span class="dot" id="mpDot"></span><span id="mpTitle">Starting Matter…</span></div>
+              <p class="muted" id="mpDetail">Bringing the Matter stack up on the bridge.</p>
+              <div class="btn-row">
+                <button type="button" class="primary" id="mpOpenBtn">Open 10-minute pairing window</button>
+                <button type="button" class="danger" id="mpCloseBtn">Close pairing window</button>
+              </div>
+            </div>
+
+            <div id="mpPairSection" class="hidden">
+              <ol class="steps">
+                <li>Keep this page open and press <strong>Open 10-minute pairing window</strong>.</li>
+                <li>In your Matter app (Google Home, Apple Home, etc.), choose <strong>Add device &rarr; Matter-enabled device</strong>.</li>
+                <li>Scan the setup QR code, or choose to enter a code manually and use the one below.</li>
+                <li>Wait here for the status to change to <strong>Paired</strong>.</li>
+              </ol>
+              <div class="card">
+                <strong>Setup QR payload</strong>
+                <div class="code" id="mpQrCode">–</div>
+                <a id="mpQrLink" class="button primary" target="_blank" rel="noopener" aria-disabled="true">Open scanner-friendly QR code</a>
+              </div>
+              <div class="card"><strong>Manual pairing code</strong><div class="code manual" id="mpManualCode">–</div><button type="button" id="mpCopyBtn">Copy manual code</button></div>
+            </div>
+            <p class="muted" id="mpNotice" role="status"></p>
+          </div>
         </div>
 
-        <div class="btn-row">
+        <div class="btn-row" id="step5NavRow">
           <button type="button" onclick="gotoStep(4)">&larr; Back</button>
           <button type="button" class="primary" onclick="prepareReview(); gotoStep(6)">Review Setup &rarr;</button>
+        </div>
+
+        <!-- Replaces the row above once pairing is showing; Back/Review no longer
+             make sense mid-pairing. -->
+        <div class="btn-row hidden" id="mpDoneRow">
+          <button type="button" class="success" id="btnWizardDone">Finish &rarr; Go to Dashboard</button>
         </div>
       </div>
 
@@ -357,44 +392,9 @@
 
         <div id="saveFeedback" style="font-size:0.9em; margin-top:0.5em;"></div>
 
-        <div class="btn-row" id="step6NavRow">
+        <div class="btn-row">
           <button type="button" onclick="gotoStep(5)">&larr; Back</button>
           <button type="button" class="success" id="btnFinishWizard">Save &amp; Launch Bridge</button>
-        </div>
-
-        <!-- Shown in place of the row above once Save & Launch succeeds with Matter
-             selected, so pairing happens inside the wizard instead of dumping the
-             installer onto the dashboard to go find it themselves. -->
-        <div id="matterPairPanel" class="hidden" style="margin-top:1.2em;">
-          <h2>Pair with Matter</h2>
-          <div class="card" id="mpStateCard">
-            <div class="status"><span class="dot" id="mpDot"></span><span id="mpTitle">Starting Matter…</span></div>
-            <p class="muted" id="mpDetail">Bringing the Matter stack up on the bridge.</p>
-            <div class="btn-row">
-              <button type="button" class="primary" id="mpOpenBtn">Open 10-minute pairing window</button>
-              <button type="button" class="danger" id="mpCloseBtn">Close pairing window</button>
-            </div>
-          </div>
-
-          <div id="mpPairSection" class="hidden">
-            <ol class="steps">
-              <li>Keep this page open and press <strong>Open 10-minute pairing window</strong>.</li>
-              <li>In your Matter app (Google Home, Apple Home, etc.), choose <strong>Add device &rarr; Matter-enabled device</strong>.</li>
-              <li>Scan the setup QR code, or choose to enter a code manually and use the one below.</li>
-              <li>Wait here for the status to change to <strong>Paired</strong>.</li>
-            </ol>
-            <div class="card">
-              <strong>Setup QR payload</strong>
-              <div class="code" id="mpQrCode">–</div>
-              <a id="mpQrLink" class="button primary" target="_blank" rel="noopener" aria-disabled="true">Open scanner-friendly QR code</a>
-            </div>
-            <div class="card"><strong>Manual pairing code</strong><div class="code manual" id="mpManualCode">–</div><button type="button" id="mpCopyBtn">Copy manual code</button></div>
-          </div>
-          <p class="muted" id="mpNotice" role="status"></p>
-
-          <div class="btn-row">
-            <button type="button" class="success" id="btnWizardDone">Finish &rarr; Go to Dashboard</button>
-          </div>
         </div>
       </div>
 
@@ -1020,12 +1020,19 @@
         });
       }
 
-      /* Matter selected: pair inside the wizard instead of sending the installer
-         to the dashboard to go find Smart Home themselves. Same endpoints and
-         state machine as smart_home.html's Matter card. */
+      /* Matter selected: pair on the Automation step itself instead of sending
+         the installer to the dashboard (or the end of the wizard) to go find
+         Smart Home themselves. Same endpoints and state machine as
+         smart_home.html's Matter card. Save & Launch is still step 6's button;
+         on success this jumps back to step 5 and swaps its module-picker for
+         the live pairing panel. */
       var mpPollTimer = null;
       function showMatterPairingPanel() {
-        document.getElementById('step6NavRow').style.display = 'none';
+        gotoStep(5);
+        document.querySelector('#step5 .module-cards').style.display = 'none';
+        document.getElementById('matterIntroText').style.display = 'none';
+        document.getElementById('step5NavRow').className = 'btn-row hidden';
+        document.getElementById('mpDoneRow').className = 'btn-row';
         document.getElementById('matterPairPanel').className = '';
         refreshMatterPairing();
         if (mpPollTimer) clearInterval(mpPollTimer);
