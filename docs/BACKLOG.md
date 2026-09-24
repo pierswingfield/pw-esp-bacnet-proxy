@@ -37,16 +37,6 @@ or overrides and the map is stored in `nvs_points`. Still fixed per-program:
 the Boost state numbers (1/4/5), the fan supply-air/speed instance lists and
 the alarm binary-values used by the Health page.
 
-- **System power command (BV13) reverts to on by itself** (observed
-  2026-09-24 on the test device, Matter build with the confirmed point map).
-  A dashboard "Turn Off" wrote BV13=0 (`system-power value=off ok=1`, read
-  back 0), then BV13 returned to 1 about 30 s later with no HTTP write, no
-  incoming Matter Invoke/Write and no MQTT on the bridge; the Matter mirror
-  only followed the change. BV13 has no priority array, so the last writer
-  wins. Not caused by the point-mapping change (same object, same write
-  path). Next: watch BV13 from a BACnet tool with the bridge idle, to tell
-  controller program logic apart from another BACnet client.
-
 - **`HVAC_CORE_MAX_ROOMS` (8) and `CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT`
   (16) are two independent constants that must be kept in sync by hand**:
   at 8 rooms the Matter side needs aggregator(1) + system(1) + boost(2) +
