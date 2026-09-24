@@ -68,6 +68,23 @@
       .module-card.selected { border-color:#06c; box-shadow:0 1px 3px rgba(37,99,235,0.15); }
       .module-card strong { font-size:0.9em; color:#0f172a; display:block; }
       .module-card p { font-size:0.78em; margin:0.35em 0 0 0; color:#64748b; line-height:1.35; }
+      /* Step 6's in-wizard Matter pairing panel - same vocabulary as smart_home.html's
+         Matter card, so Objects->Smart Home and the wizard read as one system. */
+      .status { display:flex; gap:0.6em; align-items:center; font-weight:600; }
+      .dot { width:0.7em; height:0.7em; border-radius:50%; background:#9ca3af; flex:0 0 auto; }
+      .dot.open { background:#d97706; box-shadow:0 0 0 4px #fef3c7; }
+      .dot.paired { background:#16a34a; box-shadow:0 0 0 4px #dcfce7; }
+      .dot.closed { background:#64748b; }
+      .muted { color:#64748b; font-size:0.9em; }
+      .code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; overflow-wrap:anywhere; padding:0.75em; background:#f8fafc; border:1px solid #e2e8f0; border-radius:4px; margin:0.6em 0; letter-spacing:0.02em; font-size:0.85em; }
+      .code.manual { font-size:1.2em; letter-spacing:0.1em; font-weight:700; text-align:center; }
+      .steps { counter-reset:step; padding:0; margin:0.5em 0; list-style:none; }
+      .steps li { position:relative; padding:0 0 1em 2.2em; font-size:0.88em; color:#475569; }
+      .steps li:before { counter-increment:step; content:counter(step); position:absolute; left:0; top:0; width:1.4em; height:1.4em; line-height:1.4em; text-align:center; border-radius:50%; background:#dbeafe; color:#0756a4; font-weight:700; font-size:0.85em; }
+      button.danger { color:#b91c1c; border-color:#fca5a5; }
+      a.button { display:inline-block; text-align:center; text-decoration:none; }
+      a.button[aria-disabled="true"] { opacity:0.5; pointer-events:none; }
+      .hidden { display:none; }
     </style>
     <title>Setup Wizard - ESP32 BACnet Bridge</title>
     <script src="/points.js"></script>
@@ -340,9 +357,44 @@
 
         <div id="saveFeedback" style="font-size:0.9em; margin-top:0.5em;"></div>
 
-        <div class="btn-row">
+        <div class="btn-row" id="step6NavRow">
           <button type="button" onclick="gotoStep(5)">&larr; Back</button>
           <button type="button" class="success" id="btnFinishWizard">Save &amp; Launch Bridge</button>
+        </div>
+
+        <!-- Shown in place of the row above once Save & Launch succeeds with Matter
+             selected, so pairing happens inside the wizard instead of dumping the
+             installer onto the dashboard to go find it themselves. -->
+        <div id="matterPairPanel" class="hidden" style="margin-top:1.2em;">
+          <h2>Pair with Matter</h2>
+          <div class="card" id="mpStateCard">
+            <div class="status"><span class="dot" id="mpDot"></span><span id="mpTitle">Starting Matter…</span></div>
+            <p class="muted" id="mpDetail">Bringing the Matter stack up on the bridge.</p>
+            <div class="btn-row">
+              <button type="button" class="primary" id="mpOpenBtn">Open 10-minute pairing window</button>
+              <button type="button" class="danger" id="mpCloseBtn">Close pairing window</button>
+            </div>
+          </div>
+
+          <div id="mpPairSection" class="hidden">
+            <ol class="steps">
+              <li>Keep this page open and press <strong>Open 10-minute pairing window</strong>.</li>
+              <li>In your Matter app (Google Home, Apple Home, etc.), choose <strong>Add device &rarr; Matter-enabled device</strong>.</li>
+              <li>Scan the setup QR code, or choose to enter a code manually and use the one below.</li>
+              <li>Wait here for the status to change to <strong>Paired</strong>.</li>
+            </ol>
+            <div class="card">
+              <strong>Setup QR payload</strong>
+              <div class="code" id="mpQrCode">–</div>
+              <a id="mpQrLink" class="button primary" target="_blank" rel="noopener" aria-disabled="true">Open scanner-friendly QR code</a>
+            </div>
+            <div class="card"><strong>Manual pairing code</strong><div class="code manual" id="mpManualCode">–</div><button type="button" id="mpCopyBtn">Copy manual code</button></div>
+          </div>
+          <p class="muted" id="mpNotice" role="status"></p>
+
+          <div class="btn-row">
+            <button type="button" class="success" id="btnWizardDone">Finish &rarr; Go to Dashboard</button>
+          </div>
         </div>
       </div>
 
@@ -951,8 +1003,13 @@
           body: JSON.stringify(payload)
         }).then(function(r) { return r.json(); }).then(function(res) {
           if (res.ok) {
-            fb.innerHTML = '<span class="ok"><strong>Setup complete!</strong> Bridge configured. Redirecting to Dashboard...</span>';
-            setTimeout(function() { window.location.href = '/'; }, 2000);
+            if (selectedIntegrationMode === 'matter') {
+              fb.innerHTML = '<span class="ok"><strong>Setup complete!</strong> Bridge configured.</span>';
+              showMatterPairingPanel();
+            } else {
+              fb.innerHTML = '<span class="ok"><strong>Setup complete!</strong> Bridge configured. Redirecting to Dashboard...</span>';
+              setTimeout(function() { window.location.href = '/'; }, 2000);
+            }
           } else {
             fb.innerHTML = '<span class="bad">Save failed: ' + (res.error || 'Error saving settings') + '</span>';
             btn.disabled = false;
@@ -962,6 +1019,84 @@
           setTimeout(function() { window.location.href = '/'; }, 2500);
         });
       }
+
+      /* Matter selected: pair inside the wizard instead of sending the installer
+         to the dashboard to go find Smart Home themselves. Same endpoints and
+         state machine as smart_home.html's Matter card. */
+      var mpPollTimer = null;
+      function showMatterPairingPanel() {
+        document.getElementById('step6NavRow').style.display = 'none';
+        document.getElementById('matterPairPanel').className = '';
+        refreshMatterPairing();
+        if (mpPollTimer) clearInterval(mpPollTimer);
+        mpPollTimer = setInterval(refreshMatterPairing, 3000);
+      }
+
+      function setMpState(data) {
+        var dot = document.getElementById('mpDot'), title = document.getElementById('mpTitle'), detail = document.getElementById('mpDetail');
+        dot.className = 'dot';
+        if (!data.running) {
+          title.textContent = 'Starting Matter…';
+          detail.textContent = 'This can take a few seconds after Save & Launch.';
+        } else if (data.paired) {
+          dot.className += ' paired';
+          title.textContent = 'Matter paired';
+          detail.textContent = 'A Matter controller completed commissioning.';
+        } else if (data.window_open) {
+          dot.className += ' open';
+          title.textContent = 'Pairing window open';
+          detail.textContent = 'Your Matter app can discover the bridge now. It closes automatically after 10 minutes.';
+        } else {
+          dot.className += ' closed';
+          title.textContent = 'Pairing window closed';
+          detail.textContent = 'Open a window when you are ready to pair.';
+        }
+        document.getElementById('mpOpenBtn').disabled = !data.running || data.window_open;
+        document.getElementById('mpCloseBtn').disabled = !data.running || !data.window_open;
+        document.getElementById('mpPairSection').className = data.running ? '' : 'hidden';
+        document.getElementById('mpQrCode').textContent = data.qr_code || 'Onboarding payload unavailable';
+        document.getElementById('mpManualCode').textContent = data.manual_code || 'Manual code unavailable';
+        var link = document.getElementById('mpQrLink');
+        if (data.qr_code) {
+          link.href = 'https://project-chip.github.io/connectedhomeip/qrcode.html?data=' + encodeURIComponent(data.qr_code);
+          link.setAttribute('aria-disabled', 'false');
+        } else {
+          link.removeAttribute('href');
+          link.setAttribute('aria-disabled', 'true');
+        }
+        if (data.paired && mpPollTimer) { clearInterval(mpPollTimer); mpPollTimer = null; }
+      }
+
+      function refreshMatterPairing() {
+        fetch('/api/matter/setup', { cache: 'no-store' }).then(function(r) { return r.json(); })
+          .then(function(data) { setMpState(data); })
+          .catch(function() { document.getElementById('mpNotice').textContent = 'Could not read Matter state. It will retry automatically.'; });
+      }
+
+      function mpAction(url, button, busy) {
+        button.disabled = true;
+        document.getElementById('mpNotice').textContent = busy;
+        fetch(url, { method: 'POST' }).then(function(r) { return r.json(); }).then(function(res) {
+          document.getElementById('mpNotice').textContent = res.ok ? '' : (res.error || 'Matter did not accept that action.');
+          refreshMatterPairing();
+        }).catch(function() {
+          document.getElementById('mpNotice').textContent = 'Request failed.';
+          refreshMatterPairing();
+        });
+      }
+      document.getElementById('mpOpenBtn').addEventListener('click', function() { mpAction('/api/matter/retry-pairing', this, 'Opening pairing window…'); });
+      document.getElementById('mpCloseBtn').addEventListener('click', function() { mpAction('/api/matter/close-pairing', this, 'Closing pairing window…'); });
+      document.getElementById('mpCopyBtn').addEventListener('click', function() {
+        var code = document.getElementById('mpManualCode').textContent;
+        if (code && code !== 'Manual code unavailable' && navigator.clipboard) {
+          navigator.clipboard.writeText(code);
+          document.getElementById('mpNotice').textContent = 'Manual code copied.';
+        }
+      });
+      document.getElementById('btnWizardDone').addEventListener('click', function() {
+        if (mpPollTimer) clearInterval(mpPollTimer);
+        window.location.href = '/';
+      });
 
       function escapeHtml(s) {
         if (!s) return '';
